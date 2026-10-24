@@ -173,6 +173,33 @@ describe("CodexAdapterV2 runtime policy", () => {
     }),
   );
 
+  it.effect(
+    "applies explicit approval and sandbox overrides and plan mode to a managed policy",
+    () =>
+      Effect.gen(function* () {
+        const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+          nativeThreadId: "native-overrides",
+          codexInput: [{ type: "text", text: "test" }],
+          runtimePolicy: {
+            runtimeMode: "approval-required",
+            interactionMode: "plan",
+            cwd: null,
+            approvalPolicy: "never",
+            sandboxPolicy: { type: "dangerFullAccess" },
+          },
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5.4",
+          },
+        });
+
+        // Overrides beat the mode's defaults; plan mode maps to Codex's own plan mode.
+        assert.equal(params.approvalPolicy, "never");
+        assert.equal(params.sandboxPolicy?.type, "dangerFullAccess");
+        assert.equal(params.collaborationMode?.mode, "plan");
+      }),
+  );
+
   it.effect("sends MCP app model context as untrusted Codex context", () =>
     Effect.gen(function* () {
       const policy = { runtimeMode: "full-access", interactionMode: "default", cwd: null } as const;
@@ -6474,4 +6501,22 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
     );
   });
+});
+
+describe("CodexAdapterV2 native runtime policy", () => {
+  it.effect("refuses to build turn parameters for a native policy", () =>
+    Effect.gen(function* () {
+      const error = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId: "native-policy",
+        codexInput: [{ type: "text", text: "test" }],
+        runtimePolicy: { runtimeMode: "native", interactionMode: "default", cwd: null },
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+      }).pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterProtocolError");
+      if (error._tag === "ProviderAdapterProtocolError") {
+        assert.equal(error.driver, "codex");
+        assert.include(error.message, "native");
+      }
+    }),
+  );
 });

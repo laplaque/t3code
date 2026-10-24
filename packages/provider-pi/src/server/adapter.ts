@@ -442,8 +442,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
     openSession: Effect.fn("PiAdapterV2.openSession")(function* (
       input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
+      // Pi's permission hook only knows the managed modes. Refuse the native
+      // policy before reading the MCP credential or materializing the extension.
+      const runtimePolicy = yield* ProviderAdapter.requireManagedRuntimePolicy(
+        PI_PROVIDER,
+        input.runtimePolicy,
+      );
       const scope = yield* Effect.scope;
-      const cwd = input.runtimePolicy.cwd ?? host.paths.cwd;
+      const cwd = runtimePolicy.cwd ?? host.paths.cwd;
       const mcpSession = yield* mcpSessions.read(input.threadId);
       const provideCacheFs = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
         effect.pipe(
@@ -472,7 +478,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         environment: options.environment,
         mcpSession,
         extensionPath,
-        runtimeMode: input.runtimePolicy.runtimeMode,
+        runtimeMode: runtimePolicy.runtimeMode,
       });
       const scopedLaunch = yield* agentScope.wrap({
         command: options.settings.binaryPath || "pi",

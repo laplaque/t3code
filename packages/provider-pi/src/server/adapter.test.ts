@@ -25,6 +25,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -34,6 +35,7 @@ import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
+import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -4141,5 +4143,58 @@ describe("PiRpc early process exit", () => {
       assert.isFalse(error.message.includes("API_KEY"));
       assert.isFalse(error.message.includes("super-secret"));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("PiAdapterV2 native runtime policy", () => {
+  it.effect(
+    "refuses a native policy before reading MCP context, writing the extension or launching",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const adapter = yield* makeAdapter(fake);
+        const host = yield* ProviderHost.ProviderHost;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const error = yield* adapter
+          .openSession({
+            threadId: THREAD_ID,
+            providerSessionId: SESSION_ID,
+            modelSelection: modelSelection("default"),
+            runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: "native",
+              interactionMode: "default",
+              cwd: null,
+            }),
+          })
+          .pipe(Effect.flip);
+        assert.equal(error._tag, "ProviderAdapterProtocolError");
+        assert.include(error.message, "native");
+        assert.deepEqual(fake.lastSpawn(), { args: [], env: {} });
+        assert.deepEqual(fake.allRequests(), []);
+        const cached = yield* fileSystem
+          .readDirectory(host.paths.providerStatusCacheDir)
+          .pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<string>));
+        assert.deepEqual(cached, []);
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps launching a legacy policy with Pi's own runtime-mode flag", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const adapter = yield* makeAdapter(fake);
+      yield* adapter.openSession({
+        threadId: THREAD_ID,
+        providerSessionId: SESSION_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "auto-accept-edits",
+          interactionMode: "default",
+          cwd: null,
+        }),
+      });
+      const spawn = fake.lastSpawn();
+      assert.include(spawn.args, "--extension");
+      assert.equal(spawn.env.T3_PI_RUNTIME_MODE, "auto-accept-edits");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 });

@@ -23,6 +23,10 @@ import {
   makeAntigravityStdoutTransform,
 } from "../antigravityAuthSupport.ts";
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
+import {
+  type AcpUnsupportedRuntimeMode,
+  acpUnsupportedRuntimeMode,
+} from "@t3tools/provider-acp/server/adapter";
 import { normalizeAntigravitySessionUpdate } from "./AntigravityProtocol.ts";
 
 export interface AntigravityAcpRuntimeInput extends Omit<
@@ -80,7 +84,9 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
   return yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(Effect.provide(context));
 });
 
-export function antigravityPermissionMode(runtimeMode: RuntimeMode): string {
+export function antigravityPermissionMode(
+  runtimeMode: RuntimeMode,
+): string | AcpUnsupportedRuntimeMode {
   switch (runtimeMode) {
     case "full-access":
       return "yolo";
@@ -89,6 +95,10 @@ export function antigravityPermissionMode(runtimeMode: RuntimeMode): string {
     case "auto":
     case "approval-required":
       return "default";
+    case "native":
+      // No Antigravity mode stands in for a policy T3 does not manage, so neither
+      // default nor yolo may be requested for it.
+      return acpUnsupportedRuntimeMode(runtimeMode);
   }
 }
 

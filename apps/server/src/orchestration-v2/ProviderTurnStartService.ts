@@ -546,11 +546,6 @@ export const layer: Layer.Layer<
       });
       const { isCurrentAttemptInStatus } = runControls;
 
-      const resolvedRuntimePolicy = yield* runtimePolicy.resolve({
-        thread: projection.thread,
-        modelSelection: run.modelSelection,
-      });
-      if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
       );
@@ -585,6 +580,25 @@ export const layer: Layer.Layer<
           });
         },
       );
+      const policyResolution = yield* Effect.result(
+        runtimePolicy.resolve({ thread: projection.thread, modelSelection: run.modelSelection }),
+      );
+      if (policyResolution._tag === "Failure") {
+        // A native refusal cannot change between attempts: the instance's
+        // advertisement and the stored override are what they are. Settle it now
+        // instead of leaving the run starting until the outbox gives up. Other
+        // resolution errors keep their retry budget.
+        const deterministic = policyResolution.failure._tag !== "RuntimePolicyResolveError";
+        if (input.willRetry === true && !deterministic) return yield* policyResolution.failure;
+        yield* settleStartFailure({
+          signal: "runtime-policy-refused",
+          title: "Runtime policy refused",
+          error: policyResolution.failure,
+        });
+        return;
+      }
+      const resolvedRuntimePolicy = policyResolution.success;
+      if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const failedRuns = new Map(
         projection.runs
           .filter(

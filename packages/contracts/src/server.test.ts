@@ -132,3 +132,33 @@ describe("OtlpEndpointCheckInput", () => {
     }
   });
 });
+
+describe("ServerProvider runtime-mode advertisement", () => {
+  const encode = Schema.encodeSync(ServerProvider);
+
+  it("keeps absent and empty lists as data and round-trips an explicit native entry", () => {
+    expect(decodeServerProvider(baseProviderSnapshot).supportedRuntimeModes).toBeUndefined();
+    expect(
+      decodeServerProvider({ ...baseProviderSnapshot, supportedRuntimeModes: [] })
+        .supportedRuntimeModes,
+    ).toEqual([]);
+
+    const explicit = decodeServerProvider({
+      ...baseProviderSnapshot,
+      supportedRuntimeModes: ["approval-required", "native"],
+    });
+    expect(explicit.supportedRuntimeModes).toEqual(["approval-required", "native"]);
+    const wire = JSON.parse(JSON.stringify(encode(explicit)));
+    expect(wire.supportedRuntimeModes).toEqual(["approval-required", "native"]);
+    expect(decodeServerProvider(wire)).toEqual(explicit);
+  });
+
+  it("drops a mode this build does not know while keeping native", () => {
+    expect(
+      decodeServerProvider({
+        ...baseProviderSnapshot,
+        supportedRuntimeModes: ["native", "some-future-mode"],
+      }).supportedRuntimeModes,
+    ).toEqual(["native"]);
+  });
+});

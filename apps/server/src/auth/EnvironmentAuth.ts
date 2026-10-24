@@ -24,6 +24,7 @@ import {
   DpopFailureReason,
   type DpopFailureReason as DpopFailureReasonType,
 } from "@t3tools/contracts";
+import { isManagedRuntimeMode } from "@t3tools/shared/runtimeModes";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -1266,21 +1267,34 @@ export const make = Effect.gen(function* () {
     if (token === null) return Effect.fail(new ServerAuthMissingCredentialError({}));
     return sessions.verify(token).pipe(
       mapSessionVerificationErrors,
-      Effect.flatMap((session) =>
-        session.subject === MCP_CLIENT_SUBJECT && session.method === "bearer-access-token"
-          ? Effect.succeed({
-              sessionId: session.sessionId,
-              label: session.client.label ?? "MCP client",
-              access: session.scopes.includes(AuthOrchestrationOperateScope)
-                ? (session.runtimeModeCeiling ?? "approval-required")
-                : "read-only",
-            } satisfies McpClientSession)
-          : Effect.fail(
-              new ServerAuthInvalidCredentialError({
-                diagnostic: "Only MCP client sessions are accepted here.",
-              }),
-            ),
-      ),
+      Effect.flatMap((session) => {
+        if (session.subject !== MCP_CLIENT_SUBJECT || session.method !== "bearer-access-token") {
+          return Effect.fail(
+            new ServerAuthInvalidCredentialError({
+              diagnostic: "Only MCP client sessions are accepted here.",
+            }),
+          );
+        }
+        const ceiling = session.runtimeModeCeiling;
+        // A ceiling is a managed mode T3 can compare dispatches against. The
+        // native policy has no rank, so a session carrying it cannot be
+        // relabelled as any managed access level.
+        if (ceiling !== undefined && !isManagedRuntimeMode(ceiling)) {
+          return Effect.fail(
+            new ServerAuthInvalidCredentialError({
+              diagnostic:
+                "MCP client sessions cannot carry the native runtime policy as their ceiling.",
+            }),
+          );
+        }
+        return Effect.succeed({
+          sessionId: session.sessionId,
+          label: session.client.label ?? "MCP client",
+          access: session.scopes.includes(AuthOrchestrationOperateScope)
+            ? (ceiling ?? "approval-required")
+            : "read-only",
+        } satisfies McpClientSession);
+      }),
       Effect.withSpan("EnvironmentAuth.authenticateMcpClient"),
     );
   };

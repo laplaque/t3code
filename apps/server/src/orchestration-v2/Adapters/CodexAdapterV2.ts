@@ -125,6 +125,7 @@ import {
   MCP_APP_OUTPUT_KEY,
   MCP_APP_RESOURCE_SCHEME,
 } from "@t3tools/shared/mcpApp";
+import type { ManagedRuntimeMode } from "@t3tools/shared/runtimeModes";
 import { snapshotMcpApp } from "../../mcpApps/McpAppSnapshot.ts";
 import {
   ProviderAdapterDriverCreateError,
@@ -687,7 +688,7 @@ const isProviderAdapterRuntimeRequestResponseError = Schema.is(
   ProviderAdapter.ProviderAdapterRuntimeRequestResponseError,
 );
 
-function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
+function codexRuntimeModeTurnDefaults(runtimeMode: ManagedRuntimeMode): {
   readonly approvalPolicy: CodexSchema.V2TurnStartParams__AskForApproval;
   readonly approvalsReviewer: CodexSchema.V2TurnStartParams__ApprovalsReviewer;
   readonly sandboxPolicy: CodexSchema.V2TurnStartParams__SandboxPolicy;
@@ -741,15 +742,19 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     readonly omitServiceTier?: boolean;
     readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
   }) {
-    const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
+    const runtimePolicy = yield* ProviderAdapter.requireManagedRuntimePolicy(
+      CODEX_PROVIDER,
+      input.runtimePolicy,
+    );
+    const runtimeModeDefaults = codexRuntimeModeTurnDefaults(runtimePolicy.runtimeMode);
     const approvalPolicy =
-      input.runtimePolicy.approvalPolicy === undefined
+      runtimePolicy.approvalPolicy === undefined
         ? runtimeModeDefaults.approvalPolicy
-        : yield* decodeTurnApprovalPolicy(input.runtimePolicy.approvalPolicy);
+        : yield* decodeTurnApprovalPolicy(runtimePolicy.approvalPolicy);
     const sandboxPolicy =
-      input.runtimePolicy.sandboxPolicy === undefined
+      runtimePolicy.sandboxPolicy === undefined
         ? runtimeModeDefaults.sandboxPolicy
-        : yield* decodeTurnSandboxPolicy(input.runtimePolicy.sandboxPolicy);
+        : yield* decodeTurnSandboxPolicy(runtimePolicy.sandboxPolicy);
     const selectedEffort =
       getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort") ??
       codexDefaultReasoningEffortOverride(input.modelSelection.model);
@@ -762,7 +767,7 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     const developerInstructions =
       input.hasT3Mcp !== true
         ? undefined
-        : buildCodexDeveloperInstructions(input.runtimePolicy.interactionMode);
+        : buildCodexDeveloperInstructions(runtimePolicy.interactionMode);
     // An app's context is text an MCP server wrote, so it goes in as untrusted
     // context: Codex renders it as quoted user-side input, never as developer
     // instructions.
@@ -787,10 +792,10 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
         ? undefined
         : { ...t3Context, ...appContext };
     const collaborationMode: CodexSchema.ClientRequest__CollaborationMode | undefined =
-      input.runtimePolicy.interactionMode !== "plan" && developerInstructions === undefined
+      runtimePolicy.interactionMode !== "plan" && developerInstructions === undefined
         ? undefined
         : {
-            mode: input.runtimePolicy.interactionMode === "plan" ? "plan" : "default",
+            mode: runtimePolicy.interactionMode === "plan" ? "plan" : "default",
             settings: {
               model: input.modelSelection.model,
               // Codex falls back to the model's default effort when this is left out.
@@ -805,7 +810,7 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
       threadId: input.nativeThreadId,
       input: input.codexInput,
       ...(additionalContext ? { additionalContext } : {}),
-      cwd: input.runtimePolicy.cwd,
+      cwd: runtimePolicy.cwd,
       model: input.modelSelection.model,
       // Model catalogues can default summaries to "none". Request them on every
       // turn, including resumed threads, for T3's reasoning timeline.

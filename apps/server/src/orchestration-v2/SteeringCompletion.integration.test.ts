@@ -18,9 +18,13 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -408,6 +412,12 @@ const composerSelection = {
 const nextTurnSelectionHarness = Effect.fn("nextTurnSelectionHarness")(function* (
   name: string,
   canRestart = false,
+  // When set, steerTurn signals `entered` and parks until `release`, so a test
+  // can act between the service's policy read and the provider's acceptance.
+  steerGate?: {
+    readonly entered: Deferred.Deferred<void>;
+    readonly release: Deferred.Deferred<void>;
+  },
 ) {
   const cwd = yield* checkpointWorkspace(name);
   const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
@@ -489,7 +499,11 @@ const nextTurnSelectionHarness = Effect.fn("nextTurnSelectionHarness")(function*
               });
             }),
           steerTurn: (turn) =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
+              if (steerGate !== undefined) {
+                yield* Deferred.succeed(steerGate.entered, undefined);
+                yield* Deferred.await(steerGate.release);
+              }
               steered.push(turn.message.text);
             }),
           interruptTurn: () => Effect.void,
@@ -1051,4 +1065,256 @@ it.effect("queues a plain send behind the stopped queue and releases its hold", 
       }).pipe(Effect.provide(layer));
     }),
   ),
+);
+
+// A thread whose durable policy reads native while a legacy turn is still
+// running (state a native-capable provider could leave behind) gets no further
+// input from T3: it derives no approval or sandbox for that provider, so steers
+// are refused at dispatch and at delivery. The orchestrator itself no longer
+// commits that transition while a run is live (see the last test).
+const markThreadNative = (threadId: ThreadId) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const { thread } = yield* orchestrator.getThreadProjection(threadId);
+    const now = yield* DateTime.now;
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make(`native:${threadId}`),
+          type: "thread.runtime-mode-updated" as const,
+          threadId,
+          providerInstanceId: thread.providerInstanceId,
+          occurredAt: now,
+          payload: { ...thread, runtimeMode: "native" as const, updatedAt: now },
+        },
+      ],
+    });
+  });
+
+it.effect(
+  "refuses a steer and a queued-message promotion on a thread whose durable policy is native",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { started, steered, layer, startFirstTurn } = yield* nextTurnSelectionHarness(
+          "steering-native-dispatch",
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = yield* startFirstTurn;
+          const first = started[0]!;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("queue-before-native"),
+            threadId,
+            messageId: MessageId.make("message:queued-before-native"),
+            text: "queued",
+            attachments: [],
+            modelSelection: runSelection,
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const queuedRun = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (run) => run.status === "queued",
+          )!;
+          yield* markThreadNative(threadId);
+          yield* worker.drain();
+          const steerError = yield* orchestrator
+            .dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make("steer-after-native"),
+              threadId,
+              messageId: MessageId.make("message:steer-after-native"),
+              text: "steer",
+              attachments: [],
+              modelSelection: runSelection,
+              dispatchMode: { type: "steer_active", targetRunId: first.runId },
+              createdBy: "user",
+              creationSource: "web",
+            })
+            .pipe(Effect.flip);
+          const promoteError = yield* orchestrator
+            .dispatch({
+              type: "queued-message.promote-to-steer",
+              commandId: CommandId.make("promote-after-native"),
+              threadId,
+              queuedRunId: queuedRun.id,
+              targetRunId: first.runId,
+            })
+            .pipe(Effect.flip);
+          yield* worker.drain();
+          const after = yield* orchestrator.getThreadProjection(threadId);
+          for (const error of [steerError, promoteError]) {
+            assert.equal(error._tag, "OrchestratorDispatchError");
+            if (error._tag === "OrchestratorDispatchError")
+              assert.include(String(error.cause), "native");
+          }
+          assert.deepEqual(steered, []);
+          assert.lengthOf(started, 1);
+          assert.isFalse(
+            after.messages.some(
+              (message) => message.id === MessageId.make("message:steer-after-native"),
+            ),
+          );
+          assert.equal(after.thread.runtimeMode, "native");
+          assert.equal(after.runs.find((run) => run.id === first.runId)?.status, "running");
+          assert.equal(after.runs.find((run) => run.id === queuedRun.id)?.status, "queued");
+        }).pipe(Effect.provide(layer));
+      }),
+    ),
+);
+
+it.effect(
+  "does not deliver a steer accepted before the thread's durable policy became native",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { started, steered, layer, startFirstTurn } = yield* nextTurnSelectionHarness(
+          "steering-native-delivery",
+        );
+        // The harness builds its stores on the memoized in-memory database, so an
+        // outbox layer over the same database reads the effects it enqueued.
+        const layerOutbox = EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory));
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const outbox = yield* EffectOutbox.EffectOutboxV2;
+          const threadId = yield* startFirstTurn;
+          const first = started[0]!;
+          const steerCommandId = CommandId.make("steer-before-native");
+          // The harness runs no worker, so the accepted steer waits in the outbox
+          // while the thread changes policy underneath it.
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: steerCommandId,
+            threadId,
+            messageId: MessageId.make("message:steer-before-native"),
+            text: "steer",
+            attachments: [],
+            modelSelection: runSelection,
+            dispatchMode: { type: "steer_active", targetRunId: first.runId },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const enqueued = (yield* outbox.listByCommandId(steerCommandId)).find(
+            (effect) => effect.request.type === "provider-turn.steer",
+          )!;
+          assert.equal(enqueued.status, "pending");
+          yield* markThreadNative(threadId);
+          yield* worker.drain();
+          const settled = Option.getOrThrow(yield* outbox.get(enqueued.id));
+          assert.notEqual(settled.status, "succeeded");
+          assert.isAtLeast(settled.attemptCount, 1);
+          assert.include(settled.lastError ?? "", "native");
+          assert.deepEqual(steered, []);
+          assert.lengthOf(started, 1);
+          const after = yield* orchestrator.getThreadProjection(threadId);
+          assert.equal(after.runs.find((run) => run.id === first.runId)?.status, "running");
+        }).pipe(Effect.provide(Layer.merge(layer, layerOutbox)));
+      }),
+    ),
+);
+
+// The reviewer's interleaving: the steer's policy read sees a managed thread,
+// delivery parks before the provider accepts the message, native is selected,
+// delivery resumes. Nothing orders that submission against the policy change,
+// so the selection itself is refused while a run is live; managed-to-managed
+// changes, the steer and interrupt all keep working.
+it.effect(
+  "refuses to select the native policy while a turn is live, even after a steer passed its policy read",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const steerGate = {
+          entered: yield* Deferred.make<void>(),
+          release: yield* Deferred.make<void>(),
+        };
+        const { started, steered, layer, startFirstTurn } = yield* nextTurnSelectionHarness(
+          "steering-native-transition",
+          false,
+          steerGate,
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threadId = yield* startFirstTurn;
+          const first = started[0]!;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("steer-before-transition"),
+            threadId,
+            messageId: MessageId.make("message:steer-before-transition"),
+            text: "steer",
+            attachments: [],
+            modelSelection: runSelection,
+            dispatchMode: { type: "steer_active", targetRunId: first.runId },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const delivery = yield* worker.drain().pipe(Effect.forkScoped);
+          yield* Deferred.await(steerGate.entered);
+          const nativeError = yield* orchestrator
+            .dispatch({
+              type: "thread.runtime-mode.set",
+              commandId: CommandId.make("select-native-mid-delivery"),
+              threadId,
+              runtimeMode: "native",
+            })
+            .pipe(Effect.flip);
+          assert.equal(nativeError._tag, "OrchestratorDispatchError");
+          if (nativeError._tag === "OrchestratorDispatchError")
+            assert.include(String(nativeError.cause), "live run");
+          yield* orchestrator.dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: CommandId.make("select-auto-mid-delivery"),
+            threadId,
+            runtimeMode: "auto",
+          });
+          yield* Deferred.succeed(steerGate.release, undefined);
+          yield* Fiber.join(delivery);
+          const after = yield* orchestrator.getThreadProjection(threadId);
+          assert.deepEqual(steered, ["steer"]);
+          assert.equal(after.thread.runtimeMode, "auto");
+          assert.equal(after.runs.find((run) => run.id === first.runId)?.status, "running");
+          // Interrupting the live turn is still accepted at the command boundary.
+          // Its effect is not drained: the fake adapter never terminalizes a turn,
+          // and the interrupt's terminal wait polls the event loop.
+          yield* orchestrator.dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make("interrupt-after-refusal"),
+            threadId,
+            runId: first.runId,
+          });
+          // Without a live run the selection commits; the next start refuses it.
+          const idleThreadId = ThreadId.make("thread:steering-native-transition-idle");
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("create-idle"),
+            threadId: idleThreadId,
+            projectId: ProjectId.make("project:steering-native-transition"),
+            title: "Idle thread",
+            modelSelection: runSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          yield* orchestrator.dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: CommandId.make("select-native-idle"),
+            threadId: idleThreadId,
+            runtimeMode: "native",
+          });
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(idleThreadId)).thread.runtimeMode,
+            "native",
+          );
+        }).pipe(Effect.provide(layer));
+      }),
+    ),
 );

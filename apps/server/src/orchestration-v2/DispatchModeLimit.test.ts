@@ -136,3 +136,76 @@ it.layer(layerTest)("DispatchModeLimit", (it) => {
     }),
   );
 });
+
+it.layer(layerTest)("DispatchModeLimit native policies", (it) => {
+  const fullAccess = { runtimeMode: "full-access", interactionMode: "default" } as const;
+  const native = { runtimeMode: "native", interactionMode: "default" } as const;
+
+  it.effect("refuses a limited command on a thread running a native policy, under any limit", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:limit-native-target");
+      yield* createThread(threadId);
+      yield* orchestrator.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("set-native"),
+        threadId,
+        runtimeMode: "native",
+      });
+      const rename = {
+        type: "thread.metadata.update",
+        commandId: CommandId.make("rename-native-target"),
+        threadId,
+        title: "After",
+      } as const;
+      for (const limit of [supervised, fullAccess, native]) {
+        const refused = yield* orchestrator
+          .dispatch(rename)
+          .pipe(Effect.provideService(DispatchModeLimit, limit), Effect.flip);
+        assert.equal(refused._tag, "OrchestratorThreadAboveModeLimitError", limit.runtimeMode);
+        if (refused._tag === "OrchestratorThreadAboveModeLimitError") {
+          assert.equal(refused.mode, "runtime");
+          assert.equal(refused.runtimeMode, "native");
+        }
+      }
+      assert.equal((yield* projections.getThreadShell(threadId))?.title, "Before");
+    }),
+  );
+
+  it.effect("refuses a native-limited caller even against a Supervised thread", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sourceThreadId = ThreadId.make("thread:limit-native-caller");
+      const targetThreadId = ThreadId.make("thread:limit-native-caller-fork");
+      yield* createThread(sourceThreadId);
+      const rename = {
+        type: "thread.metadata.update",
+        commandId: CommandId.make("rename-native-caller"),
+        threadId: sourceThreadId,
+        title: "After",
+      } as const;
+      const refused = yield* orchestrator
+        .dispatch(rename)
+        .pipe(Effect.provideService(DispatchModeLimit, native), Effect.flip);
+      assert.equal(refused._tag, "OrchestratorThreadAboveModeLimitError");
+      assert.equal((yield* projections.getThreadShell(sourceThreadId))?.title, "Before");
+
+      const fork = {
+        type: "thread.fork",
+        commandId: CommandId.make("fork-native-caller"),
+        sourceThreadId,
+        targetThreadId,
+        sourcePoint: { type: "latest_stable" },
+        createdBy: "agent",
+        creationSource: "mcp",
+      } as const;
+      const refusedFork = yield* orchestrator
+        .dispatch(fork)
+        .pipe(Effect.provideService(DispatchModeLimit, native), Effect.flip);
+      assert.equal(refusedFork._tag, "OrchestratorThreadAboveModeLimitError");
+      assert.isNull(yield* projections.getThreadShell(targetThreadId));
+    }),
+  );
+});

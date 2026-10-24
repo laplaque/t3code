@@ -1,4 +1,5 @@
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
+import { isManagedRuntimeMode } from "@t3tools/shared/runtimeModes";
 import {
   MessageId,
   type NodeId,
@@ -344,6 +345,17 @@ export const layer: Layer.Layer<
           }
           const loaded = yield* load({ ...input, operation: "steer" });
           if (Option.isNone(loaded.session)) return;
+          // The steer was accepted under the policy the thread had at dispatch.
+          // Deliver it only against the policy the thread has now.
+          const thread = yield* projections.getThread(input.threadId);
+          if (!isManagedRuntimeMode(thread.runtimeMode)) {
+            return yield* new ProviderTurnControlError({
+              threadId: input.threadId,
+              operation: "steer",
+              providerTurnId: input.providerTurnId,
+              cause: `Thread ${input.threadId} now runs under the native policy; the steer is not delivered.`,
+            });
+          }
           const { message, run } = loaded.context;
           if (message === undefined || run === undefined) {
             return yield* new ProviderTurnControlError({

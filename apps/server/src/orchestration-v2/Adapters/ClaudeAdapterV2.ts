@@ -2046,7 +2046,7 @@ function readOnlyPolicyAllowsGlobalReads(
 }
 
 function permissionModeForClaudeRuntimePolicy(
-  runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+  runtimePolicy: ProviderAdapter.ProviderAdapterV2ManagedRuntimePolicy,
 ): PermissionMode {
   if (runtimePolicy.interactionMode === "plan") {
     return "plan";
@@ -2113,7 +2113,7 @@ const CLAUDE_BYPASS_FULLY_AVAILABLE: ClaudeBypassAvailability = {
 };
 
 export function claudeRuntimeQueryPolicyForRuntimePolicy(
-  runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+  runtimePolicy: ProviderAdapter.ProviderAdapterV2ManagedRuntimePolicy,
   availability: ClaudeBypassAvailability = CLAUDE_BYPASS_FULLY_AVAILABLE,
 ): ClaudeRuntimeQueryPolicy {
   const requestedMode = permissionModeForClaudeRuntimePolicy(runtimePolicy);
@@ -4085,28 +4085,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         let bypassCache: { cwd: string | null; availability: ClaudeBypassAvailability } | null =
           null;
         const queryPolicyForTurn = Effect.fnUntraced(function* (
-          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2ManagedRuntimePolicy,
         ) {
-          if (
-            permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy) !== "bypassPermissions"
-          ) {
-            return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
+          if (permissionModeForClaudeRuntimePolicy(runtimePolicy) !== "bypassPermissions") {
+            return claudeRuntimeQueryPolicyForRuntimePolicy(runtimePolicy);
           }
-          const cwd = turnInput.runtimePolicy.cwd;
+          const cwd = runtimePolicy.cwd;
           if (bypassCache === null || bypassCache.cwd !== cwd) {
             const resolved = yield* resolveBypassAvailability(cwd).pipe(Effect.option);
             if (Option.isNone(resolved)) {
-              return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy, {
+              return claudeRuntimeQueryPolicyForRuntimePolicy(runtimePolicy, {
                 bypassDisabled: true,
                 autoDisabled: false,
               });
             }
             bypassCache = { cwd, availability: resolved.value };
           }
-          return claudeRuntimeQueryPolicyForRuntimePolicy(
-            turnInput.runtimePolicy,
-            bypassCache.availability,
-          );
+          return claudeRuntimeQueryPolicyForRuntimePolicy(runtimePolicy, bypassCache.availability);
         });
         const openedNativeThreads = yield* Ref.make(new Set<string>());
         const latestPlanByKind = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact>());
@@ -9187,8 +9182,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const openQuery = Effect.fnUntraced(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           nativeThreadId: string,
+          managedRuntimePolicy: ProviderAdapter.ProviderAdapterV2ManagedRuntimePolicy,
         ) {
-          const queryPolicy = yield* queryPolicyForTurn(turnInput);
+          const queryPolicy = yield* queryPolicyForTurn(managedRuntimePolicy);
           const mcpOverrides = claudeMcpQueryOverrides({
             mcpSession: yield* mcpSessions.read(turnInput.threadId),
             readOnlySandbox:
@@ -9474,6 +9470,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 reason: "previous_turn_active",
               });
             }
+            // Refuse a native policy before any Plan, override or bypass shortcut
+            // could pick a permission mode for it.
+            const managedRuntimePolicy = yield* ProviderAdapter.requireManagedRuntimePolicy(
+              CLAUDE_PROVIDER,
+              turnInput.runtimePolicy,
+            );
             yield* Ref.update(lastTurnRouteByNativeThread, (current) => {
               const updated = new Map(current);
               updated.set(nativeThreadId, {
@@ -9500,7 +9502,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     skills: yield* userInvocableSkills(turnInput.runtimePolicy.cwd),
                     uuid: promptUuid,
                   });
-            const querySession = yield* openQuery(turnInput, nativeThreadId);
+            const querySession = yield* openQuery(turnInput, nativeThreadId, managedRuntimePolicy);
             const context: ActiveClaudeTurnContext = {
               input: turnInput,
               queryPolicy: querySession.queryPolicy,
@@ -9552,7 +9554,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               yield* Ref.set(activeTurn, context);
               if (
                 !isClaudeProviderContinuationTurn(turnInput) &&
-                permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy) ===
+                permissionModeForClaudeRuntimePolicy(managedRuntimePolicy) ===
                   "bypassPermissions" &&
                 context.queryPolicy.permissionMode !== "bypassPermissions" &&
                 !announcedBypassDowngrades.has(turnInput.threadId)

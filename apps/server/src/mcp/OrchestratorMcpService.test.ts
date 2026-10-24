@@ -72,7 +72,7 @@ describe("OrchestratorMcpService", () => {
       const acknowledgementCommandIds = yield* Ref.make<ReadonlyArray<string>>([]);
       const acknowledgementAttempts = yield* Ref.make(0);
       const parentProjection = {
-        thread: { id: parentThreadId },
+        thread: { id: parentThreadId, runtimeMode: "full-access", interactionMode: "default" },
         runs: [],
         contextTransfers: [],
         subagents: [
@@ -205,7 +205,7 @@ describe("OrchestratorMcpService", () => {
       let awaitsRestart = true;
       let readFails = true;
       const parentProjection = {
-        thread: { id: parentThreadId },
+        thread: { id: parentThreadId, runtimeMode: "full-access", interactionMode: "default" },
         runs: [],
         contextTransfers: [],
         subagents: [
@@ -299,7 +299,7 @@ describe("OrchestratorMcpService", () => {
       const taskId = NodeId.make("node:mcp-cancel-task");
       const dispatched = yield* Ref.make<ReadonlyArray<unknown>>([]);
       const parentProjection = {
-        thread: { id: parentThreadId },
+        thread: { id: parentThreadId, runtimeMode: "full-access", interactionMode: "default" },
         runs: [],
         contextTransfers: [],
         subagents: [
@@ -380,7 +380,7 @@ describe("OrchestratorMcpService", () => {
         const status = yield* Ref.make("running");
         const parentProjection = (taskStatus: string) =>
           ({
-            thread: { id: parentThreadId },
+            thread: { id: parentThreadId, runtimeMode: "full-access", interactionMode: "default" },
             runs: [],
             contextTransfers: [],
             subagents: [
@@ -486,7 +486,7 @@ describe("OrchestratorMcpService", () => {
       const taskId = NodeId.make("node:mcp-cancel-failed-task");
       const dispatched = yield* Ref.make<ReadonlyArray<unknown>>([]);
       const parentProjection = {
-        thread: { id: parentThreadId },
+        thread: { id: parentThreadId, runtimeMode: "full-access", interactionMode: "default" },
         runs: [],
         contextTransfers: [],
         subagents: [
@@ -566,7 +566,7 @@ describe("OrchestratorMcpService", () => {
       const taskId = NodeId.make("node:mcp-cancel-dispose-failed-task");
       const dispatched = yield* Ref.make<ReadonlyArray<unknown>>([]);
       const parentProjection = {
-        thread: { id: parentThreadId },
+        thread: { id: parentThreadId, runtimeMode: "full-access", interactionMode: "default" },
         runs: [],
         contextTransfers: [],
         subagents: [
@@ -2266,6 +2266,57 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.equal(updated.webhookUrl, undefined);
       }),
     );
+
+    const fullAccessClient: McpInvocationScope = {
+      ...supervisedClient,
+      client: { sessionId: "scheduled", label: "Claude Code", access: "full-access" },
+    };
+
+    it.effect("hides a native task from every caller and refuses to update it", () =>
+      Effect.gen(function* () {
+        const upserted = yield* Ref.make(0);
+        const nativeTask = task({
+          id: ScheduledTaskId.make("scheduled-task:native"),
+          runtimeMode: "native",
+        });
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(service([nativeTask], null, upserted)),
+        );
+        const listed = yield* mcp.listScheduledTasks(fullAccessClient, { projectId });
+        assert.equal(listed.tasks[0]?.webhookUrl, undefined);
+        const error = yield* mcp
+          .updateScheduledTask(fullAccessClient, {
+            scheduledTaskId: nativeTask.id,
+            prompt: "Something else",
+          })
+          .pipe(Effect.flip);
+        assert.equal(error.code, "runtime_mode_escalation_denied");
+        assert.include(error.message, "native");
+        assert.equal(yield* Ref.get(upserted), 0);
+      }),
+    );
+
+    it.effect("treats a bound thread that now runs a native policy as above every caller", () =>
+      Effect.gen(function* () {
+        const upserted = yield* Ref.make(0);
+        const bound = task({ threadId: boundThreadId });
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(
+            service([bound], liveThreadShell(boundThreadId, { runtimeMode: "native" }), upserted),
+          ),
+        );
+        const listed = yield* mcp.listScheduledTasks(fullAccessClient, { projectId });
+        assert.equal(listed.tasks[0]?.webhookUrl, undefined);
+        const error = yield* mcp
+          .updateScheduledTask(fullAccessClient, {
+            scheduledTaskId: bound.id,
+            prompt: "Something else",
+          })
+          .pipe(Effect.flip);
+        assert.equal(error.code, "runtime_mode_escalation_denied");
+        assert.equal(yield* Ref.get(upserted), 0);
+      }),
+    );
   });
   it.effect(
     "reports the child run's selection after a restart and the thread selection before launch",
@@ -2454,6 +2505,56 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
   );
 
+  it.effect("refuses an explicit native child before any command is dispatched", () =>
+    Effect.gen(function* () {
+      const commands: Array<unknown> = [];
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          hasReceipt: () => Effect.succeed(false),
+          assertProviderInstanceEnabled: () => Effect.void,
+          getThreadRecords: (threadId) =>
+            Effect.succeed(threadId === parentThreadId ? parentProjection([]) : childProjection),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              commands.push(command);
+              return { sequence: 1, storedEvents: [] } as never;
+            }),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([
+          {
+            ...providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "gpt-5.4",
+            }),
+            supportedRuntimeModes: ["approval-required", "native"],
+          },
+        ]),
+        adapterRegistryLayer([codexInstanceId]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const error = yield* service
+          .delegateTask(scope, {
+            task: "Review the change.",
+            target: yield* decodeTarget({}),
+            runtimeMode: "native",
+            mode: "async",
+            clientRequestId: "native-child",
+          })
+          .pipe(Effect.flip);
+        assert.equal(error.code, "runtime_mode_escalation_denied");
+        assert.include(error.message, "native");
+        assert.deepEqual(commands, []);
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    }),
+  );
+
   describe("resolveRuntimeMode", () => {
     const muse = {
       modelSelection: { instanceId: ProviderInstanceId.make("muse"), model: "muse-model" },
@@ -2481,6 +2582,60 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.equal(
           yield* OrchestratorMcpService.resolveRuntimeMode("auto", undefined, muse),
           "approval-required",
+        );
+      }),
+    );
+
+    it.effect("refuses native on either side of a bounded dispatch", () =>
+      Effect.gen(function* () {
+        const nativeCapable = {
+          modelSelection: muse.modelSelection,
+          supportedRuntimeModes: ["approval-required", "native"] as const,
+        };
+        const explicit = yield* OrchestratorMcpService.resolveRuntimeMode(
+          "full-access",
+          "native",
+          nativeCapable,
+        ).pipe(Effect.flip);
+        assert.equal(explicit.code, "runtime_mode_escalation_denied");
+        assert.include(explicit.message, "native");
+        const inherited = yield* OrchestratorMcpService.resolveRuntimeMode(
+          "native",
+          "inherit",
+          nativeCapable,
+        ).pipe(Effect.flip);
+        assert.equal(inherited.code, "runtime_mode_escalation_denied");
+        const narrower = yield* OrchestratorMcpService.resolveRuntimeMode(
+          "native",
+          "approval-required",
+          muse,
+        ).pipe(Effect.flip);
+        assert.equal(narrower.code, "runtime_mode_escalation_denied");
+        const withoutTarget = yield* OrchestratorMcpService.resolveRuntimeMode(
+          "native",
+          undefined,
+        ).pipe(Effect.flip);
+        assert.equal(withoutTarget.code, "runtime_mode_escalation_denied");
+      }),
+    );
+
+    it.effect("never steps an inherited legacy mode onto an advertised native entry", () =>
+      Effect.gen(function* () {
+        const nativeOnly = {
+          modelSelection: muse.modelSelection,
+          supportedRuntimeModes: ["native"] as const,
+        };
+        assert.equal(
+          yield* OrchestratorMcpService.resolveRuntimeMode("auto", "inherit", nativeOnly),
+          "approval-required",
+        );
+        const mixed = {
+          modelSelection: muse.modelSelection,
+          supportedRuntimeModes: ["approval-required", "native", "auto-accept-edits"] as const,
+        };
+        assert.equal(
+          yield* OrchestratorMcpService.resolveRuntimeMode("auto", undefined, mixed),
+          "auto-accept-edits",
         );
       }),
     );

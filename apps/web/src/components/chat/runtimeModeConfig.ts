@@ -1,5 +1,12 @@
 import type { RuntimeMode } from "@t3tools/contracts";
-import { type LucideIcon, LockIcon, LockOpenIcon, PenLineIcon, SparklesIcon } from "lucide-react";
+import {
+  type LucideIcon,
+  LockIcon,
+  LockOpenIcon,
+  PenLineIcon,
+  ShieldIcon,
+  SparklesIcon,
+} from "lucide-react";
 
 export const runtimeModeConfig: Record<
   RuntimeMode,
@@ -25,6 +32,18 @@ export const runtimeModeConfig: Record<
     description: "Allow commands and edits without prompts.",
     icon: LockOpenIcon,
   },
+  native: {
+    label: "Use harness policy",
+    description: "The provider's own permission rules decide; its approvals still apply.",
+    icon: ShieldIcon,
+  },
 };
 
-export const runtimeModeOptions = Object.keys(runtimeModeConfig) as RuntimeMode[];
+// Native stays out of every picker until a provider advertises it and the
+// composer can hold an unsupported selection without silently replacing it.
+export const runtimeModeOptions: ReadonlyArray<RuntimeMode> = [
+  "approval-required",
+  "auto-accept-edits",
+  "auto",
+  "full-access",
+];

@@ -5,6 +5,7 @@ import * as Schema from "effect/Schema";
 import { NodeId, RunAttemptId, TrimmedNonEmptyString } from "./index.ts";
 import {
   latestProviderTurnForAttempt,
+  OrchestrationV2Command,
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderThreadJson,
@@ -13,9 +14,11 @@ import {
   OrchestrationV2ThreadShellJson,
   OrchestrationV2SubagentJson,
   OrchestrationV2ThreadHistoryPage,
+  OrchestrationV2ThreadLaunchInput,
   OrchestrationV2TurnItem,
   OrchestrationV2TurnItemJson,
 } from "./orchestrationV2.ts";
+import { DEFAULT_RUNTIME_MODE, RuntimeMode } from "./providerPolicy.ts";
 
 const now = DateTime.makeUnsafe("2026-04-20T00:00:00.000Z");
 
@@ -610,5 +613,81 @@ describe("latestProviderTurnForAttempt", () => {
     ];
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
+  });
+});
+
+describe("runtime modes", () => {
+  const decodeCommand = Schema.decodeUnknownSync(Schema.toCodecJson(OrchestrationV2Command));
+  const encodeCommand = Schema.encodeSync(Schema.toCodecJson(OrchestrationV2Command));
+  const decodeLaunchInput = Schema.decodeUnknownSync(
+    Schema.toCodecJson(OrchestrationV2ThreadLaunchInput),
+  );
+  const modelSelection = { instanceId: "codex", model: "gpt-5-codex" };
+
+  it("keeps Full access as the default and lists native after the four legacy modes", () => {
+    expect(DEFAULT_RUNTIME_MODE).toBe("full-access");
+    expect(RuntimeMode.literals).toEqual([
+      "approval-required",
+      "auto-accept-edits",
+      "auto",
+      "full-access",
+      "native",
+    ]);
+  });
+
+  it("decodes and round-trips native thread creation, mode changes and delegated tasks", () => {
+    const commands = [
+      {
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: "command-create",
+        threadId: "thread-1",
+        projectId: "project-1",
+        title: "Thread",
+        modelSelection,
+        runtimeMode: "native",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      },
+      {
+        type: "thread.runtime-mode.set",
+        commandId: "command-set-mode",
+        threadId: "thread-1",
+        runtimeMode: "native",
+      },
+      {
+        type: "delegated_task.request",
+        createdBy: "agent",
+        creationSource: "mcp",
+        commandId: "command-delegate",
+        parentThreadId: "thread-1",
+        parentRunId: "run-1",
+        parentNodeId: "node-1",
+        task: "Review the change.",
+        modelSelection,
+        runtimeMode: "native",
+        interactionMode: "default",
+      },
+    ];
+    for (const command of commands) {
+      const decoded = decodeCommand(command);
+      expect(decoded).toMatchObject({ type: command.type, runtimeMode: "native" });
+      expect(JSON.parse(JSON.stringify(encodeCommand(decoded)))).toEqual(command);
+    }
+  });
+
+  it("decodes a native thread launch input without rewriting the mode", () => {
+    const launched = decodeLaunchInput({
+      commandId: "command-launch",
+      projectId: "project-1",
+      title: "Launch",
+      modelSelection,
+      runtimeMode: "native",
+      interactionMode: "default",
+      workspaceStrategy: { type: "root" },
+    });
+    expect(launched.runtimeMode).toBe("native");
   });
 });

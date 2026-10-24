@@ -39,6 +39,10 @@
       "types": "./src/model.ts",
       "import": "./src/model.ts"
     },
+    "./runtimeModes": {
+      "types": "./src/runtimeModes.ts",
+      "import": "./src/runtimeModes.ts"
+    },
     "./advertisedEndpoint": {
       "types": "./src/advertisedEndpoint.ts",
       "import": "./src/advertisedEndpoint.ts"

@@ -62,17 +62,28 @@ function makeThread(input: {
 }
 
 const grokInstanceId = ProviderInstanceId.make("grok");
-const supportedRuntimeModesByInstance = new Map<ProviderInstanceId, ReadonlyArray<RuntimeMode>>([
+const nativeInstanceId = ProviderInstanceId.make("native-capable");
+const emptyListInstanceId = ProviderInstanceId.make("empty-list");
+const missingInstanceId = ProviderInstanceId.make("missing");
+const supportedRuntimeModesByInstance = new Map<
+  ProviderInstanceId,
+  ReadonlyArray<RuntimeMode> | undefined
+>([
+  [providerInstanceId, undefined],
   [grokInstanceId, ["approval-required", "auto", "full-access"]],
+  [nativeInstanceId, ["approval-required", "native"]],
+  [emptyListInstanceId, []],
 ]);
-const providerInstanceFor = (instanceId: ProviderInstanceId) =>
-  ({
-    snapshot: {
-      getSnapshot: Effect.succeed({
-        supportedRuntimeModes: supportedRuntimeModesByInstance.get(instanceId),
-      } as ServerProvider),
-    },
-  }) as ProviderInstance;
+const providerInstanceFor = (instanceId: ProviderInstanceId): ProviderInstance | undefined =>
+  supportedRuntimeModesByInstance.has(instanceId)
+    ? ({
+        snapshot: {
+          getSnapshot: Effect.succeed({
+            supportedRuntimeModes: supportedRuntimeModesByInstance.get(instanceId),
+          } as ServerProvider),
+        },
+      } as ProviderInstance)
+    : undefined;
 
 const layerTest = RuntimePolicy.layerFromProjectStore.pipe(
   Layer.provide(
@@ -124,6 +135,179 @@ it.layer(layerTest)("RuntimePolicyV2", (it) => {
       assert.equal(yield* modeFor(grokInstanceId, "auto"), "auto");
       assert.equal(yield* modeFor(grokInstanceId, "full-access"), "full-access");
       assert.equal(yield* modeFor(providerInstanceId, "auto-accept-edits"), "auto-accept-edits");
+    }),
+  );
+});
+
+it.layer(layerTest)("RuntimePolicyV2 native policy", (it) => {
+  const resolveNative = (
+    instanceId: ProviderInstanceId,
+    input: { readonly worktreePath?: string | null; readonly runtimeMode?: RuntimeMode } = {},
+  ) =>
+    Effect.gen(function* () {
+      const policy = yield* RuntimePolicy.RuntimePolicyV2;
+      const now = yield* DateTime.now;
+      return yield* policy.resolve({
+        thread: makeThread({
+          now,
+          worktreePath: input.worktreePath === undefined ? "/worktree" : input.worktreePath,
+          runtimeMode: input.runtimeMode ?? "native",
+        }),
+        modelSelection: { instanceId, model: "test-model" },
+      });
+    });
+
+  it.effect("refuses native unless the selected instance advertises it explicitly", () =>
+    Effect.gen(function* () {
+      for (const instanceId of [
+        missingInstanceId,
+        providerInstanceId,
+        emptyListInstanceId,
+        grokInstanceId,
+      ]) {
+        const error = yield* resolveNative(instanceId).pipe(Effect.flip);
+        assert.equal(error._tag, "RuntimePolicyNativeUnsupportedError", instanceId);
+        assert.equal(error.providerInstanceId, instanceId);
+        assert.equal(error.projectId, projectId);
+        assert.include(error.message, `${instanceId} does not advertise the native runtime policy`);
+      }
+    }),
+  );
+
+  it.effect("passes an advertised native policy through without T3 overrides", () =>
+    Effect.gen(function* () {
+      assert.deepEqual(yield* resolveNative(nativeInstanceId), {
+        runtimeMode: "native",
+        interactionMode: "default",
+        cwd: "/worktree",
+      });
+      assert.deepEqual(yield* resolveNative(nativeInstanceId, { worktreePath: null }), {
+        runtimeMode: "native",
+        interactionMode: "default",
+        cwd: "/project-root",
+      });
+    }),
+  );
+
+  it.effect("keeps legacy modes on a native-capable instance unchanged", () =>
+    Effect.gen(function* () {
+      const resolved = yield* resolveNative(nativeInstanceId, { runtimeMode: "auto" });
+      assert.equal(resolved.runtimeMode, "approval-required");
+      assert.equal(
+        (yield* resolveNative(nativeInstanceId, { runtimeMode: "approval-required" })).runtimeMode,
+        "approval-required",
+      );
+    }),
+  );
+
+  const withOverride = <A, E, R>(
+    override: RuntimePolicy.RuntimePolicyV2Override,
+    effect: Effect.Effect<A, E, R>,
+  ) => effect.pipe(Effect.provide(RuntimePolicy.layerWithOverride(override)));
+
+  it.effect("refuses explicit approval or sandbox overrides on a native policy", () =>
+    Effect.gen(function* () {
+      const overrides: ReadonlyArray<RuntimePolicy.RuntimePolicyV2Override> = [
+        { approvalPolicy: "never" },
+        { sandboxPolicy: { type: "dangerFullAccess" } },
+        { approvalPolicy: null },
+        { sandboxPolicy: null },
+        { approvalPolicy: "on-request", sandboxPolicy: { type: "workspaceWrite" }, cwd: "/else" },
+      ];
+      for (const override of overrides) {
+        const error = yield* withOverride(override, resolveNative(nativeInstanceId)).pipe(
+          Effect.flip,
+        );
+        assert.equal(
+          error._tag,
+          "RuntimePolicyNativeOverrideConflictError",
+          JSON.stringify(override),
+        );
+        assert.equal(error.providerInstanceId, nativeInstanceId);
+        assert.equal(error.projectId, projectId);
+        if (error._tag === "RuntimePolicyNativeOverrideConflictError") {
+          assert.deepEqual(
+            error.overrides,
+            (["approvalPolicy", "sandboxPolicy"] as const).filter(
+              (key) => override[key] !== undefined,
+            ),
+          );
+          assert.include(
+            error.message,
+            `cannot be combined with the native runtime policy for provider instance ${nativeInstanceId}`,
+          );
+        }
+      }
+    }),
+  );
+
+  it.effect("allows cwd and reasoning overrides on an advertised native policy", () =>
+    Effect.gen(function* () {
+      assert.deepEqual(
+        yield* withOverride(
+          { cwd: "/override", reasoningEffort: "high" },
+          resolveNative(nativeInstanceId),
+        ),
+        {
+          runtimeMode: "native",
+          interactionMode: "default",
+          cwd: "/override",
+          reasoningEffort: "high",
+        },
+      );
+    }),
+  );
+
+  it.effect("does not let an override turn an unadvertised native policy into a run", () =>
+    Effect.gen(function* () {
+      const error = yield* withOverride({ cwd: "/override" }, resolveNative(grokInstanceId)).pipe(
+        Effect.flip,
+      );
+      assert.equal(error._tag, "RuntimePolicyNativeUnsupportedError");
+    }),
+  );
+
+  it.effect("still applies explicit overrides to legacy policies", () =>
+    Effect.gen(function* () {
+      const resolved = yield* withOverride(
+        { approvalPolicy: "never", sandboxPolicy: { type: "readOnly" } },
+        resolveNative(providerInstanceId, { runtimeMode: "full-access" }),
+      );
+      assert.equal(resolved.runtimeMode, "full-access");
+      assert.equal(resolved.approvalPolicy, "never");
+      assert.deepEqual(resolved.sandboxPolicy, { type: "readOnly" });
+    }),
+  );
+});
+
+it.layer(RuntimePolicy.layer)("RuntimePolicyV2 capability-free layer", (it) => {
+  it.effect("refuses native because it cannot know any instance supports it", () =>
+    Effect.gen(function* () {
+      const policy = yield* RuntimePolicy.RuntimePolicyV2;
+      const now = yield* DateTime.now;
+      const error = yield* policy
+        .resolve({
+          thread: makeThread({ now, worktreePath: "/worktree", runtimeMode: "native" }),
+          modelSelection,
+        })
+        .pipe(Effect.flip);
+      assert.equal(error._tag, "RuntimePolicyNativeUnsupportedError");
+      assert.equal(error.providerInstanceId, providerInstanceId);
+      assert.equal(error.projectId, projectId);
+    }),
+  );
+
+  it.effect("passes legacy modes through unchanged", () =>
+    Effect.gen(function* () {
+      const policy = yield* RuntimePolicy.RuntimePolicyV2;
+      const now = yield* DateTime.now;
+      assert.deepEqual(
+        yield* policy.resolve({
+          thread: makeThread({ now, worktreePath: "/worktree", runtimeMode: "auto" }),
+          modelSelection,
+        }),
+        { runtimeMode: "auto", interactionMode: "default", cwd: "/worktree" },
+      );
     }),
   );
 });

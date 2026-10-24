@@ -1243,3 +1243,95 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+const policyRefusals = (projectId: ProjectId) => ({
+  "unsupported native": new RuntimePolicy.RuntimePolicyNativeUnsupportedError({
+    projectId,
+    providerInstanceId: ProviderInstanceId.make("codex"),
+  }),
+  "native with overrides": new RuntimePolicy.RuntimePolicyNativeOverrideConflictError({
+    projectId,
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    overrides: ["approvalPolicy", "sandboxPolicy"],
+  }),
+  "resolution error": new RuntimePolicy.RuntimePolicyResolveError({
+    projectId,
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    cause: "Project not found.",
+  }),
+});
+
+effectIt.effect.each([
+  { refusal: "unsupported native", retry: false },
+  { refusal: "unsupported native", retry: true },
+  { refusal: "native with overrides", retry: false },
+  { refusal: "native with overrides", retry: true },
+  { refusal: "resolution error", retry: false },
+] as const)(
+  "settles the run as failed when the runtime policy is refused ($refusal, willRetry=$retry)",
+  ({ refusal, retry }) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({ text: "Continue" });
+      const projection = harness.projection();
+      const providerThread = projection.providerThreads[0]!;
+      const ensureThread = vi.fn(() => Effect.succeed(providerThread));
+      const resumeThread = vi.fn(() => Effect.succeed(providerThread));
+      const forkThread = vi.fn(() => Effect.succeed(providerThread));
+      harness.open.mockReturnValue(
+        Effect.succeed({
+          driver: providerThread.driver,
+          ensureThread,
+          resumeThread,
+          forkThread,
+        } as never),
+      );
+      const error = policyRefusals(projection.thread.projectId)[refusal];
+      harness.resolveRuntimePolicy.mockReturnValue(Effect.fail(error) as never);
+
+      yield* retry ? harness.startWithRetry : harness.start;
+
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(ensureThread).not.toHaveBeenCalled();
+      expect(resumeThread).not.toHaveBeenCalled();
+      expect(forkThread).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.writeIfRunCurrent).toHaveBeenCalledWith(
+        expect.objectContaining({ activeAttemptId: harness.attemptId, expectedStatus: "starting" }),
+      );
+      const settled = harness.projection();
+      expect(settled.runs.at(-1)).toMatchObject({ status: "failed", startedAt: null });
+      expect(settled.attempts[0]).toMatchObject({ status: "failed", startedAt: null });
+      expect(settled.nodes[0]).toMatchObject({ status: "failed", startedAt: null });
+      // Like every other start failure, the item surfaces the nested cause when
+      // there is one; the native refusals carry their reason in the message itself.
+      const message = refusal === "resolution error" ? "Project not found." : error.message;
+      expect(settled.turnItems).toMatchObject([
+        {
+          type: "error",
+          status: "failed",
+          title: "Runtime policy refused",
+          failure: { class: "provider_error", message },
+        },
+      ]);
+    }),
+);
+
+effectIt.effect(
+  "keeps retrying a resolution error while the worker will retry, without starting",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({ text: "Continue" });
+      const projection = harness.projection();
+      const error = policyRefusals(projection.thread.projectId)["resolution error"];
+      harness.resolveRuntimePolicy.mockReturnValue(Effect.fail(error) as never);
+
+      const failure = yield* harness.startWithRetry.pipe(Effect.flip);
+
+      expect(failure._tag).toBe("ProviderTurnStartError");
+      expect(failure.cause).toBe(error);
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+      expect(harness.projection()).toEqual(projection);
+    }),
+);

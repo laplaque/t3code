@@ -13,6 +13,7 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
+  antigravityPermissionMode,
   applyAntigravityAcpModelSelection,
   buildAntigravityPrompt,
 } from "./AntigravityAcpSupport.ts";
@@ -485,4 +486,20 @@ it.layer(NodeServices.layer)("buildAntigravityPrompt", (it) => {
       });
     }),
   );
+});
+
+describe("antigravityPermissionMode", () => {
+  it("maps the four managed modes onto Antigravity's own modes", () => {
+    expect(antigravityPermissionMode("full-access")).toBe("yolo");
+    expect(antigravityPermissionMode("auto-accept-edits")).toBe("auto_edit");
+    expect(antigravityPermissionMode("auto")).toBe("default");
+    expect(antigravityPermissionMode("approval-required")).toBe("default");
+  });
+
+  it("refuses a native policy explicitly instead of falling back to default or yolo", () => {
+    expect(antigravityPermissionMode("native")).toEqual({
+      _tag: "AcpUnsupportedRuntimeMode",
+      runtimeMode: "native",
+    });
+  });
 });

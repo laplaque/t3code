@@ -1,5 +1,10 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { authScopeResponse, AuthStandardClientScopes } from "@t3tools/contracts";
+import {
+  authScopeResponse,
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  AuthStandardClientScopes,
+} from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -599,5 +604,87 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       } as never);
       expect(verified.sessionId).toBe(bearer.sessionId);
     }).pipe(Effect.provide(layerEnvironmentAuth({ mode: "web", host: "192.168.1.50" }))),
+  );
+});
+
+it.layer(NodeServices.layer)("EnvironmentAuth.authenticateMcpClient", (it) => {
+  const mcpClient = { label: "Synthetic MCP client", deviceType: "bot" as const };
+  const authenticate = (token: string) =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      return yield* serverAuth.authenticateMcpClient(makeBearerRequest(token));
+    });
+
+  it.effect("keeps every issued managed or read-only ceiling as the client's access", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      for (const access of [
+        "read-only",
+        "approval-required",
+        "auto-accept-edits",
+        "auto",
+        "full-access",
+      ] as const) {
+        const issued = yield* serverAuth.issueMcpClientSession({
+          access,
+          label: mcpClient.label,
+          client: mcpClient,
+        });
+        const session = yield* authenticate(issued.token);
+        expect(session.access).toBe(access);
+        expect(session.label).toBe(mcpClient.label);
+      }
+    }).pipe(Effect.provide(layerEnvironmentAuth())),
+  );
+
+  it.effect("runs an operate-scoped session without a ceiling as Supervised", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue({
+        subject: "mcp-client",
+        method: "bearer-access-token",
+        scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+        // No ceiling and no label: the boundary fills in both defaults.
+        client: { deviceType: "bot" },
+      });
+      const session = yield* authenticate(issued.token);
+      expect(session.access).toBe("approval-required");
+      expect(session.label).toBe("MCP client");
+    }).pipe(Effect.provide(layerEnvironmentAuth())),
+  );
+
+  it.effect("rejects a session whose ceiling is the native policy instead of relabelling it", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      for (const scopes of [
+        [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+        [AuthOrchestrationReadScope],
+      ] as const) {
+        const issued = yield* sessions.issue({
+          subject: "mcp-client",
+          method: "bearer-access-token",
+          scopes: [...scopes],
+          runtimeModeCeiling: "native",
+          client: mcpClient,
+        });
+        const error = yield* authenticate(issued.token).pipe(Effect.flip);
+        expect(error).toMatchObject({
+          _tag: "ServerAuthInvalidCredentialError",
+          diagnostic: expect.stringContaining("native"),
+        });
+      }
+    }).pipe(Effect.provide(layerEnvironmentAuth())),
+  );
+
+  it.effect("still rejects a session that is not an MCP client session", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const bearer = yield* serverAuth.issueSession();
+      const error = yield* authenticate(bearer.token).pipe(Effect.flip);
+      expect(error).toMatchObject({
+        _tag: "ServerAuthInvalidCredentialError",
+        diagnostic: "Only MCP client sessions are accepted here.",
+      });
+    }).pipe(Effect.provide(layerEnvironmentAuth())),
   );
 });

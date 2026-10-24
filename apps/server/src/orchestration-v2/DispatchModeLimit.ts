@@ -1,4 +1,5 @@
 import type { ProviderInteractionMode, RuntimeMode, ThreadId } from "@t3tools/contracts";
+import { isRuntimeModeWithinLimit } from "@t3tools/shared/runtimeModes";
 import * as Context from "effect/Context";
 import type * as Ref from "effect/Ref";
 
@@ -26,19 +27,14 @@ export const DispatchModeLimit = Context.Reference<DispatchModeLimitValue | unde
   { defaultValue: () => undefined },
 );
 
-const runtimeModeRank: Record<RuntimeMode, number> = {
-  "approval-required": 0,
-  "auto-accept-edits": 1,
-  auto: 2,
-  "full-access": 3,
-};
 const interactionModeRank: Record<ProviderInteractionMode, number> = { plan: 0, default: 1 };
 
+/** A native policy has no place in the managed order, so it exceeds the limit on either side. */
 export const exceededDispatchModeLimit = (
   limit: DispatchModes,
   modes: DispatchModes,
 ): "runtime" | "interaction" | undefined =>
-  runtimeModeRank[modes.runtimeMode] > runtimeModeRank[limit.runtimeMode]
+  !isRuntimeModeWithinLimit(limit.runtimeMode, modes.runtimeMode)
     ? "runtime"
     : interactionModeRank[modes.interactionMode] > interactionModeRank[limit.interactionMode]
       ? "interaction"

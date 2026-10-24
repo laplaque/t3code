@@ -34,9 +34,10 @@ import {
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
+import { isManagedRuntimeMode, type ManagedRuntimeMode } from "@t3tools/shared/runtimeModes";
 import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
@@ -54,6 +55,22 @@ export const ProviderAdapterV2RuntimePolicy = Schema.Struct({
   reasoningEffort: Schema.optional(Schema.String),
 });
 export type ProviderAdapterV2RuntimePolicy = typeof ProviderAdapterV2RuntimePolicy.Type;
+
+/**
+ * A policy whose mode T3 manages itself. Adapters without native handling
+ * narrow to it before deriving sandbox, approval or permission settings, so
+ * their mappers stay exhaustive over the four managed modes.
+ */
+export type ProviderAdapterV2ManagedRuntimePolicy = Omit<
+  ProviderAdapterV2RuntimePolicy,
+  "runtimeMode"
+> & {
+  readonly runtimeMode: ManagedRuntimeMode;
+};
+
+export const isProviderAdapterV2ManagedRuntimePolicy = (
+  policy: ProviderAdapterV2RuntimePolicy,
+): policy is ProviderAdapterV2ManagedRuntimePolicy => isManagedRuntimeMode(policy.runtimeMode);
 
 export const ProviderAdapterV2TurnMessage = Schema.Struct({
   messageId: MessageId,
@@ -382,6 +399,23 @@ export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAda
     return `${this.driver} provider protocol error: ${this.detail}.`;
   }
 }
+
+/**
+ * The refusal every non-participating adapter gives a native policy, ahead of
+ * any Plan, default or bypass shortcut its own mappers would otherwise take.
+ */
+export const requireManagedRuntimePolicy = (
+  driver: ProviderDriverKind,
+  policy: ProviderAdapterV2RuntimePolicy,
+): Effect.Effect<ProviderAdapterV2ManagedRuntimePolicy, ProviderAdapterProtocolError> =>
+  isProviderAdapterV2ManagedRuntimePolicy(policy)
+    ? Effect.succeed(policy)
+    : Effect.fail(
+        new ProviderAdapterProtocolError({
+          driver,
+          detail: `the native runtime policy is not supported by the ${driver} adapter`,
+        }),
+      );
 
 export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterCapabilitiesError,
