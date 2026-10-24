@@ -68,6 +68,12 @@ import {
 import { getProviderOptionCurrentValue } from "@t3tools/shared/model";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import {
+  isManagedRuntimeMode,
+  isRuntimeModeSupported,
+  isRuntimeModeWithinLimit,
+  managedRuntimeModeRank,
+} from "@t3tools/shared/runtimeModes";
+import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
 } from "../sourceControl/threadPullRequests.ts";
@@ -672,19 +678,6 @@ function canExposeTaskRunResult(run: OrchestrationV2Run | undefined): run is Orc
   );
 }
 
-function runtimeModeRank(mode: RuntimeMode): number {
-  switch (mode) {
-    case "approval-required":
-      return 0;
-    case "auto-accept-edits":
-      return 1;
-    case "auto":
-      return 2;
-    case "full-access":
-      return 3;
-  }
-}
-
 function interactionModeRank(mode: ProviderInteractionMode): number {
   return mode === "plan" ? 0 : 1;
 }
@@ -696,30 +689,37 @@ export function resolveRuntimeMode(
 ): Effect.Effect<RuntimeMode, OrchestratorMcpFailure> {
   const inherited = requested === undefined || requested === "inherit";
   const resolved = inherited ? parentMode : requested;
-  if (runtimeModeRank(resolved) > runtimeModeRank(parentMode)) {
+  // A native policy on either side has no managed ceiling to compare, so the
+  // check fails closed rather than inventing an equivalence.
+  if (!isManagedRuntimeMode(resolved) || !isRuntimeModeWithinLimit(parentMode, resolved)) {
     return Effect.fail(
       failure(
         "runtime_mode_escalation_denied",
-        `Child runtime mode ${resolved} is broader than parent mode ${parentMode}.`,
+        isManagedRuntimeMode(resolved) && isManagedRuntimeMode(parentMode)
+          ? `Child runtime mode ${resolved} is broader than parent mode ${parentMode}.`
+          : `Child runtime mode ${resolved} cannot be checked against parent mode ${parentMode}: a native policy has no T3 ceiling.`,
       ),
     );
   }
-  const supported = target?.supportedRuntimeModes;
-  if (supported === undefined || supported.length === 0 || supported.includes(resolved)) {
+  // Only an advertised list can leave a managed mode unoffered; native was
+  // refused above, and an absent list keeps every managed mode available.
+  const offered = target?.supportedRuntimeModes;
+  if (offered === undefined || isRuntimeModeSupported(resolved, offered)) {
     return Effect.succeed(resolved);
   }
   if (!inherited) {
     return Effect.fail(
       failure(
         "invalid_request",
-        `Provider ${target?.modelSelection.instanceId} does not offer runtime mode ${resolved}, so it would run as approval-required. Use one of: ${supported.join(", ")}.`,
+        `Provider ${target?.modelSelection.instanceId} does not offer runtime mode ${resolved}, so it would run as approval-required. Use one of: ${offered.join(", ")}.`,
       ),
     );
   }
   return Effect.succeed(
-    supported
-      .filter((mode) => runtimeModeRank(mode) <= runtimeModeRank(resolved))
-      .toSorted((left, right) => runtimeModeRank(right) - runtimeModeRank(left))[0] ??
+    offered
+      .filter(isManagedRuntimeMode)
+      .filter((mode) => managedRuntimeModeRank(mode) <= managedRuntimeModeRank(resolved))
+      .toSorted((left, right) => managedRuntimeModeRank(right) - managedRuntimeModeRank(left))[0] ??
       "approval-required",
   );
 }
@@ -1746,7 +1746,7 @@ const make = Effect.gen(function* () {
     },
     modes: { readonly runtimeMode: RuntimeMode; readonly interactionMode: ProviderInteractionMode },
   ) =>
-    runtimeModeRank(modes.runtimeMode) <= runtimeModeRank(limits.runtimeMode) &&
+    isRuntimeModeWithinLimit(limits.runtimeMode, modes.runtimeMode) &&
     interactionModeRank(modes.interactionMode) <= interactionModeRank(limits.interactionMode);
 
   /**

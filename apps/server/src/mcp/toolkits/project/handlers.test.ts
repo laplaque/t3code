@@ -3,6 +3,7 @@ import {
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
+  type AuthMcpClientAccess,
   type Project as ProjectRecord,
   type ModelSelection,
   type RuntimeMode,
@@ -30,7 +31,7 @@ import * as ProjectHandlers from "./handlers.ts";
 import { ProjectToolkit } from "./tools.ts";
 
 const clientLaunchHarness = (input: {
-  readonly runtimeModeCeiling: RuntimeMode;
+  readonly runtimeModeCeiling: AuthMcpClientAccess;
   readonly defaultRuntimeMode?: RuntimeMode;
   /** Where Settings saves a project's model; the legacy project field stays null. */
   readonly overrideModel?: ModelSelection;
@@ -121,7 +122,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const launchWith = Effect.fn("test.launchWith")(function* (
-        runtimeModeCeiling: RuntimeMode,
+        runtimeModeCeiling: AuthMcpClientAccess,
         defaultRuntimeMode: RuntimeMode,
         params: {
           readonly title: string;

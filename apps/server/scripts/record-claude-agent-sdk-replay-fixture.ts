@@ -441,21 +441,27 @@ validateClaudeReplayRecordingSelection({
 function runtimePolicyForRecording(input: {
   readonly cwd: string;
   readonly override?: RuntimePolicyV2Override;
-}): ProviderAdapter.ProviderAdapterV2RuntimePolicy {
-  return ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-    runtimeMode: "full-access",
-    interactionMode: "default",
-    cwd: input.override?.cwd ?? input.cwd,
-    ...(input.override?.approvalPolicy === undefined
-      ? {}
-      : { approvalPolicy: input.override.approvalPolicy }),
-    ...(input.override?.sandboxPolicy === undefined
-      ? {}
-      : { sandboxPolicy: input.override.sandboxPolicy }),
-    ...(input.override?.reasoningEffort === undefined
-      ? {}
-      : { reasoningEffort: input.override.reasoningEffort }),
-  });
+}): ProviderAdapter.ProviderAdapterV2ManagedRuntimePolicy {
+  // Recordings always run Full access; an override can adjust cwd, approval,
+  // sandbox or effort but never the mode, so the result stays managed.
+  const runtimeMode = "full-access" as const;
+  return {
+    ...ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode,
+      interactionMode: "default",
+      cwd: input.override?.cwd ?? input.cwd,
+      ...(input.override?.approvalPolicy === undefined
+        ? {}
+        : { approvalPolicy: input.override.approvalPolicy }),
+      ...(input.override?.sandboxPolicy === undefined
+        ? {}
+        : { sandboxPolicy: input.override.sandboxPolicy }),
+      ...(input.override?.reasoningEffort === undefined
+        ? {}
+        : { reasoningEffort: input.override.reasoningEffort }),
+    }),
+    runtimeMode,
+  };
 }
 
 async function makeToolCallReadOnlyRecordingWorkspace(): Promise<string> {

@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import {
+  MessageId,
   type ModelSelection,
   NodeId,
   type OrchestrationV2ProviderThread,
@@ -14,6 +15,7 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -328,5 +330,110 @@ it.effect(
       assert.equal(interrupted?.providerSessionId, oldSessionId);
       assert.equal(interrupted?.id, providerThreadId);
       assert.equal(interrupted?.nativeThreadRef?.nativeId, "native-thread:restart-session");
+    }),
+);
+
+it.effect.each([
+  { mode: "full-access", delivered: true },
+  { mode: "native", delivered: false },
+] as const)(
+  "delivers a queued steer only while the thread's current policy is managed ($mode)",
+  ({ mode, delivered }) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make(`thread:steer-policy:${mode}`);
+      const providerSessionId = ProviderSessionId.make(`provider-session:steer-policy:${mode}`);
+      const providerThreadId = ProviderThreadId.make(`provider-thread:steer-policy:${mode}`);
+      const providerTurnId = ProviderTurnId.make(`provider-turn:steer-policy:${mode}`);
+      const attemptId = RunAttemptId.make(`run-attempt:steer-policy:${mode}`);
+      const messageId = MessageId.make(`message:steer-policy:${mode}`);
+      const providerThread: OrchestrationV2ProviderThread = {
+        id: providerThreadId,
+        driver,
+        providerInstanceId,
+        providerSessionId,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: { driver, nativeId: `native-thread:${mode}`, strength: "strong" },
+        nativeConversationHeadRef: null,
+        status: "active",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const base = makeProjection({ now, threadId, providerThread, providerTurnId, attemptId });
+      // The effect was enqueued under a managed mode; delivery must consult the
+      // thread as it is now, not as it was when the steer was accepted.
+      const thread = { ...base.thread, runtimeMode: mode };
+      const run = { id: RunId.make(`run:steer-policy:${mode}`), status: "running" } as never;
+      const message = {
+        id: messageId,
+        text: "steer",
+        attachments: [],
+        createdBy: "user",
+        creationSource: "web",
+      } as never;
+      const steered: Array<MessageId> = [];
+      const runtime = {
+        instanceId: providerInstanceId,
+        driver,
+        providerSessionId,
+        events: Stream.empty,
+        steerTurn: (input: { readonly message: { readonly messageId: MessageId } }) =>
+          Effect.sync(() => {
+            steered.push(input.message.messageId);
+          }),
+      } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+      const layerControl = ProviderTurnControlService.layer.pipe(
+        Layer.provide(
+          Layer.merge(
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getThread: () => Effect.succeed(thread),
+              getProviderControlContext: () =>
+                Effect.succeed({
+                  providerThread,
+                  providerTurn: base.providerTurns[0],
+                  attempt: undefined,
+                  message,
+                  run,
+                }),
+            }),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+              get: () => Effect.succeed(Option.some(runtime)),
+            }),
+          ),
+        ),
+      );
+      const exit = yield* Effect.gen(function* () {
+        const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+        return yield* Effect.exit(
+          control.steer({
+            threadId,
+            providerSessionId,
+            providerThreadId,
+            providerTurnId,
+            messageId,
+          }),
+        );
+      }).pipe(Effect.provide(layerControl));
+      if (delivered) {
+        assert.isTrue(Exit.isSuccess(exit));
+        assert.deepEqual(steered, [messageId]);
+      } else {
+        assert.isTrue(Exit.isFailure(exit));
+        const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+        assert.equal(
+          (error as { readonly _tag?: string } | undefined)?._tag,
+          "ProviderTurnControlError",
+        );
+        assert.include(
+          String((error as { readonly cause?: unknown } | undefined)?.cause),
+          "native",
+        );
+        assert.deepEqual(steered, []);
+      }
     }),
 );

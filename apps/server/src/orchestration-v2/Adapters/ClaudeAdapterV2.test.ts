@@ -157,6 +157,17 @@ const CLAUDE_TEST_RUNTIME_POLICY = ProviderAdapter.ProviderAdapterV2RuntimePolic
   interactionMode: "default",
   cwd: "/workspace",
 });
+// The pure query-policy helpers only accept a policy the adapter has already
+// narrowed; tests of those helpers narrow their fixtures the same way.
+const managedRuntimePolicy = (
+  input: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+): ProviderAdapter.ProviderAdapterV2ManagedRuntimePolicy => {
+  const policy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make(input);
+  if (!ProviderAdapter.isProviderAdapterV2ManagedRuntimePolicy(policy)) {
+    throw new Error(`Test policy must be managed, got ${policy.runtimeMode}`);
+  }
+  return policy;
+};
 
 function makeClaudeTestAppThread(input: {
   readonly threadId: ThreadId;
@@ -316,7 +327,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
   it("maps canonical read-only never policy to Claude dontAsk with read-only tools", () => {
     const queryPolicy = ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(
-      ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      managedRuntimePolicy({
         runtimeMode: "full-access",
         interactionMode: "default",
         cwd: "/workspace",
@@ -339,7 +350,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
   it("does not auto-allow reads for canonical restricted read-only never policy", () => {
     const queryPolicy = ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(
-      ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      managedRuntimePolicy({
         runtimeMode: "full-access",
         interactionMode: "default",
         cwd: "/workspace",
@@ -365,7 +376,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
   it("maps default full-access policy to Claude bypass permissions", () => {
     const queryPolicy = ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(
-      ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      managedRuntimePolicy({
         runtimeMode: "full-access",
         interactionMode: "default",
         cwd: "/workspace",
@@ -380,7 +391,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
   });
 
   it("keeps approval checks when Full access must fall back to an allowed Claude mode", () => {
-    const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+    const runtimePolicy = managedRuntimePolicy({
       runtimeMode: "full-access",
       interactionMode: "default",
       cwd: "/workspace",
@@ -405,7 +416,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
 
   it("keeps approval-required mode interactive with danger-full-access sandboxing", () => {
     const queryPolicy = ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(
-      ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      managedRuntimePolicy({
         runtimeMode: "approval-required",
         interactionMode: "default",
         cwd: "/workspace",
@@ -470,7 +481,7 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
     const threadId = ThreadId.make("thread-claude-mcp-credential-rotation");
     const mcpSession = mcpSessionFor(threadId);
     const queryPolicy = ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(
-      ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      managedRuntimePolicy({
         runtimeMode: "approval-required",
         interactionMode: "default",
         cwd: "/workspace",
@@ -13407,5 +13418,103 @@ describe("ClaudeAdapterV2 query message stream", () => {
       yield* Scope.close(scope, Exit.void);
       assert.isTrue(closed);
     }),
+  );
+});
+
+describe("ClaudeAdapterV2 native runtime policy", () => {
+  it.effect(
+    "refuses a native turn before any Plan, approval or bypass shortcut opens a query",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const idAllocator = yield* IdAllocator.IdAllocatorV2;
+          const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+            prefix: "t3-claude-native-policy-",
+          });
+          let opened = 0;
+          const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+            instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+            settings: DEFAULT_CLAUDE_SETTINGS,
+            environment: {},
+            attachmentsDir,
+            fileSystem,
+            path: yield* Path.Path,
+            crypto: yield* Crypto.Crypto,
+            idAllocator,
+            queryRunner: {
+              allocateSessionId: Effect.succeed("native-thread-claude-native-policy"),
+              open: () =>
+                Effect.sync(() => {
+                  opened += 1;
+                  return {
+                    messages: Stream.never,
+                    offer: () => Effect.void,
+                    setModel: () => Effect.void,
+                    applyFlagSettings: () => Effect.void,
+                    setPermissionMode: () => Effect.void,
+                    backgroundTasks: () => Effect.succeed(false),
+                    stopTask: () => Effect.void,
+                    interrupt: Effect.void,
+                    close: Effect.void,
+                  };
+                }),
+              forkSession: () => Effect.die("unused"),
+              subagentLaunchToolUseId: () => Effect.succeed(null),
+              assertComplete: Effect.void,
+            },
+          });
+          const threadId = ThreadId.make("thread-claude-native-policy");
+          const runtime = yield* adapter.openSession({
+            threadId,
+            providerSessionId: ProviderSessionId.make("provider-session-claude-native-policy"),
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+          });
+          const providerThread = yield* runtime.ensureThread({
+            threadId,
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+          });
+          const now = yield* DateTime.now;
+          const nativePolicies = [
+            { runtimeMode: "native", interactionMode: "default", cwd: "/workspace" },
+            { runtimeMode: "native", interactionMode: "plan", cwd: "/workspace" },
+            {
+              runtimeMode: "native",
+              interactionMode: "default",
+              cwd: "/workspace",
+              approvalPolicy: "never",
+              sandboxPolicy: { type: "dangerFullAccess" },
+            },
+          ] as const;
+          for (const [index, policy] of nativePolicies.entries()) {
+            const error = yield* runtime
+              .startTurn(
+                makeClaudeTestTurnInput({
+                  threadId,
+                  providerThread,
+                  now,
+                  attemptId: RunAttemptId.make(`attempt-claude-native-policy-${index}`),
+                  text: "Run node.",
+                  attachments: [],
+                  runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make(policy),
+                }),
+              )
+              .pipe(Effect.flip);
+            const refusal =
+              error._tag === "ProviderAdapterTurnStartError"
+                ? (error.cause as { readonly _tag?: string; readonly message?: string })
+                : error;
+            assert.equal(refusal._tag, "ProviderAdapterProtocolError", JSON.stringify(policy));
+            assert.include(refusal.message ?? "", "native");
+          }
+          assert.equal(opened, 0);
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 });

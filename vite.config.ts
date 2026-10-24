@@ -80,6 +80,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    coverage: { provider: "v8" },
     exclude: TEST_EXCLUDE,
     hookTimeout: 60_000,
     testTimeout: 60_000,

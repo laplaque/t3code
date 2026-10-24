@@ -27,6 +27,9 @@ export const RuntimeMode = Schema.Literals([
   "auto-accept-edits",
   "auto",
   "full-access",
+  // The provider instance's own permission configuration decides. T3 derives no
+  // sandbox or approval policy from it and cannot rank it against the modes above.
+  "native",
 ]);
 export type RuntimeMode = typeof RuntimeMode.Type;
 export const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";

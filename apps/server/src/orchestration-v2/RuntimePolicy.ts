@@ -3,8 +3,8 @@ import {
   OrchestrationV2AppThread,
   ProjectId,
   ProviderInstanceId,
-  type RuntimeMode,
 } from "@t3tools/contracts";
+import { resolveProviderRuntimeMode } from "@t3tools/shared/runtimeModes";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -28,7 +28,36 @@ export class RuntimePolicyResolveError extends Schema.TaggedError<RuntimePolicyR
   }
 }
 
-export const RuntimePolicyV2Error = Schema.Union([RuntimePolicyResolveError]);
+export class RuntimePolicyNativeUnsupportedError extends Schema.TaggedError<RuntimePolicyNativeUnsupportedError>()(
+  "RuntimePolicyNativeUnsupportedError",
+  {
+    projectId: ProjectId,
+    providerInstanceId: ProviderInstanceId,
+  },
+) {
+  override get message(): string {
+    return `Provider instance ${this.providerInstanceId} does not advertise the native runtime policy, so the thread cannot run with it.`;
+  }
+}
+
+export class RuntimePolicyNativeOverrideConflictError extends Schema.TaggedError<RuntimePolicyNativeOverrideConflictError>()(
+  "RuntimePolicyNativeOverrideConflictError",
+  {
+    projectId: ProjectId,
+    providerInstanceId: ProviderInstanceId,
+    overrides: Schema.Array(Schema.Literals(["approvalPolicy", "sandboxPolicy"])),
+  },
+) {
+  override get message(): string {
+    return `Explicit ${this.overrides.join(" and ")} overrides cannot be combined with the native runtime policy for provider instance ${this.providerInstanceId}.`;
+  }
+}
+
+export const RuntimePolicyV2Error = Schema.Union([
+  RuntimePolicyResolveError,
+  RuntimePolicyNativeUnsupportedError,
+  RuntimePolicyNativeOverrideConflictError,
+]);
 export type RuntimePolicyV2Error = typeof RuntimePolicyV2Error.Type;
 
 export const RuntimePolicyV2Override = Schema.Struct({
@@ -50,25 +79,25 @@ export class RuntimePolicyV2 extends Context.Service<RuntimePolicyV2, RuntimePol
   "t3/orchestration-v2/RuntimePolicy/RuntimePolicyV2",
 ) {}
 
+// Without a capability snapshot nothing can vouch for native support, so this
+// layer refuses it like an instance that does not advertise it.
 export const layer: Layer.Layer<RuntimePolicyV2> = Layer.succeed(RuntimePolicyV2, {
-  resolve: (input) =>
-    Effect.succeed({
-      runtimeMode: input.thread.runtimeMode,
-      interactionMode: input.thread.interactionMode,
-      cwd: input.thread.worktreePath,
-    }),
+  resolve: (input) => {
+    const resolution = resolveProviderRuntimeMode(input.thread.runtimeMode, undefined);
+    return resolution.type === "unsupported"
+      ? Effect.fail(
+          new RuntimePolicyNativeUnsupportedError({
+            projectId: input.thread.projectId,
+            providerInstanceId: input.modelSelection.instanceId,
+          }),
+        )
+      : Effect.succeed({
+          runtimeMode: resolution.runtimeMode,
+          interactionMode: input.thread.interactionMode,
+          cwd: input.thread.worktreePath,
+        });
+  },
 });
-
-function providerRuntimeMode(
-  runtimeMode: RuntimeMode,
-  supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
-): RuntimeMode {
-  return supportedRuntimeModes === undefined ||
-    supportedRuntimeModes.length === 0 ||
-    supportedRuntimeModes.includes(runtimeMode)
-    ? runtimeMode
-    : "approval-required";
-}
 
 export const layerFromProjectStore: Layer.Layer<
   RuntimePolicyV2,
@@ -86,6 +115,16 @@ export const layerFromProjectStore: Layer.Layer<
           instance === undefined
             ? undefined
             : (yield* instance.snapshot.getSnapshot).supportedRuntimeModes;
+        const resolution = resolveProviderRuntimeMode(
+          input.thread.runtimeMode,
+          supportedRuntimeModes,
+        );
+        if (resolution.type === "unsupported") {
+          return yield* new RuntimePolicyNativeUnsupportedError({
+            projectId: input.thread.projectId,
+            providerInstanceId: input.modelSelection.instanceId,
+          });
+        }
         const cwd =
           input.thread.worktreePath ??
           (yield* projects.get(input.thread.projectId).pipe(
@@ -112,7 +151,7 @@ export const layerFromProjectStore: Layer.Layer<
             ),
           ));
         return ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-          runtimeMode: providerRuntimeMode(input.thread.runtimeMode, supportedRuntimeModes),
+          runtimeMode: resolution.runtimeMode,
           interactionMode: input.thread.interactionMode,
           cwd,
         });
@@ -131,21 +170,38 @@ export function layerWithOverride(
       return {
         resolve: (input) =>
           base.resolve(input).pipe(
-            Effect.map((policy) =>
-              ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-                ...policy,
-                ...(override.cwd === undefined ? {} : { cwd: override.cwd }),
-                ...(override.approvalPolicy === undefined
-                  ? {}
-                  : { approvalPolicy: override.approvalPolicy }),
-                ...(override.sandboxPolicy === undefined
-                  ? {}
-                  : { sandboxPolicy: override.sandboxPolicy }),
-                ...(override.reasoningEffort === undefined
-                  ? {}
-                  : { reasoningEffort: override.reasoningEffort }),
-              }),
-            ),
+            Effect.flatMap((policy) => {
+              // A native policy belongs to the provider; an explicit T3 sandbox or
+              // approval override would silently contradict it, so refuse rather
+              // than drop the override.
+              const conflicting = (["approvalPolicy", "sandboxPolicy"] as const).filter(
+                (key) => override[key] !== undefined,
+              );
+              if (policy.runtimeMode === "native" && conflicting.length > 0) {
+                return Effect.fail(
+                  new RuntimePolicyNativeOverrideConflictError({
+                    projectId: input.thread.projectId,
+                    providerInstanceId: input.modelSelection.instanceId,
+                    overrides: conflicting,
+                  }),
+                );
+              }
+              return Effect.succeed(
+                ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+                  ...policy,
+                  ...(override.cwd === undefined ? {} : { cwd: override.cwd }),
+                  ...(override.approvalPolicy === undefined
+                    ? {}
+                    : { approvalPolicy: override.approvalPolicy }),
+                  ...(override.sandboxPolicy === undefined
+                    ? {}
+                    : { sandboxPolicy: override.sandboxPolicy }),
+                  ...(override.reasoningEffort === undefined
+                    ? {}
+                    : { reasoningEffort: override.reasoningEffort }),
+                }),
+              );
+            }),
           ),
       } satisfies RuntimePolicyV2Shape;
     }),

@@ -65,6 +65,7 @@ import {
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { recordThreadOpen } from "@t3tools/shared/paletteSearch";
+import { isManagedRuntimeMode } from "@t3tools/shared/runtimeModes";
 import {
   derivePendingBackgroundWork,
   pendingBackgroundTurnItems,
@@ -2700,6 +2701,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.threadId} is deleted.`,
       });
     }
+    // A steer accepted under a managed policy can still be on its way to the
+    // provider when a native selection would commit, and nothing in T3 orders
+    // that submission against the policy change. Switching between a managed
+    // mode and the native policy is therefore refused while any run is live;
+    // changes between managed modes keep their existing behaviour.
+    if (
+      command.type === "thread.runtime-mode.set" &&
+      isManagedRuntimeMode(command.runtimeMode) !== isManagedRuntimeMode(thread.runtimeMode)
+    ) {
+      const { runs } = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs"])
+        .pipe(mapDispatchError(command));
+      if (runs.some(isBlockingRun)) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread ${command.threadId} has a live run; switching between a managed mode and the native policy is not supported while a turn is live. Interrupt the turn first.`,
+        });
+      }
+    }
     if (
       command.type === "thread.pull-request.watch" &&
       command.watching &&
@@ -4154,6 +4175,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         commandId: input.command.commandId,
         commandType: input.command.type,
         cause: `Target run ${input.targetRunId} was not found.`,
+      });
+    }
+    // A steer rides on a turn T3 supervises. Under the native policy T3 derives
+    // no approval or sandbox for the provider, so it records neither the
+    // steering message nor a delivery effect.
+    if (!isManagedRuntimeMode(input.projection.thread.runtimeMode)) {
+      return yield* new OrchestratorDispatchError({
+        commandId: input.command.commandId,
+        commandType: input.command.type,
+        cause: `Thread ${input.command.threadId} runs under the native policy and cannot be steered.`,
       });
     }
     if (isNativeMaintenanceCommand(input)) {

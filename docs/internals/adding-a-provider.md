@@ -29,8 +29,18 @@ capabilities, never the driver kind.
   `supportedRuntimeModes` in the provider presentation ([Grok](../../packages/provider-grok/src/server/status.ts)
   and [Pi](../../packages/provider-pi/src/server/status.ts) are examples). Do not imitate a missing
   mode by answering approvals in T3: T3's check is weaker than the agent's own enforcement. The
-  server runs an unoffered stored mode as Supervised
+  server runs an unoffered stored legacy mode as Supervised
   ([`RuntimePolicy.ts`](../../apps/server/src/orchestration-v2/RuntimePolicy.ts)).
+- **Native policy.** `native` means the instance's own permission configuration decides, so T3
+  derives no sandbox, approval policy or reviewer from it. A missing or empty list never implies it;
+  the server refuses a thread that asks for it from an instance that does not advertise it, instead
+  of running another mode, and adapters that do not implement it refuse it before launching or
+  configuring anything ([`ProviderAdapter.ts`](../../packages/provider-core/src/server/ProviderAdapter.ts)).
+  Advertise it only once the adapter provably preserves that configuration on start, resume, every
+  turn and every approval, with replay evidence for each path; no shipped driver advertises it yet.
+  It also has no rank among the managed modes
+  ([`runtimeModes.ts`](../../packages/shared/src/runtimeModes.ts)): delegation, MCP and
+  scheduled-task limits refuse to compare a native caller or target, so those checks fail closed.
 - **Approval and question options.** Pass the provider's own option IDs through unchanged. Every
   request needs a way to decline that the provider honors.
 - **Interaction modes.** Hide the plan toggle (`showInteractionModeToggle: false`) unless the

@@ -27,6 +27,7 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
+import { makeAcpAdapterV2 } from "@t3tools/provider-acp/server/adapter";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -670,6 +671,232 @@ describe("AntigravityAdapterV2 html_render pages", () => {
       assert.strictEqual(yield* mcpSessions.takeHtmlRender(threadId, report), undefined);
       assert.strictEqual(yield* mcpSessions.takeHtmlRender(threadId, failed), undefined);
       assert.strictEqual(yield* mcpSessions.takeHtmlRender(threadId, errored), undefined);
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+});
+
+describe("AntigravityAdapterV2 native runtime policy", () => {
+  const instanceId = ProviderInstanceId.make("antigravity-native-policy-test");
+  const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+  const protocolCause = (error: { readonly cause?: unknown }) =>
+    error.cause as { readonly _tag?: string; readonly message?: string } | undefined;
+
+  it.effect("refuses to open a session for a native policy before launching the agent", () =>
+    Effect.gen(function* () {
+      let launched = false;
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: () =>
+          Effect.sync(() => {
+            launched = true;
+          }).pipe(Effect.andThen(Effect.die("the agent must not launch for a native policy"))),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.succeed(undefined),
+      });
+      const error = yield* adapter
+        .openSession({
+          threadId: ThreadId.make("thread-antigravity-native-policy"),
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-native-policy"),
+          modelSelection,
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "native",
+            interactionMode: "default",
+            cwd: null,
+          }),
+        })
+        .pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterOpenSessionError");
+      assert.equal(protocolCause(error)?._tag, "ProviderAdapterProtocolError");
+      assert.include(protocolCause(error)?.message ?? "", "native");
+      assert.isFalse(launched);
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect("turns a flavor's unsupported-mode result into a typed failure, not a mode write", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const crypto = yield* Crypto.Crypto;
+      const path = yield* Path.Path;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const selfInvocation = yield* resolveSelfInvocation();
+      const antigravityFlavor = makeAntigravityAcpAdapterFlavor({
+        instanceId,
+        crypto,
+        fileSystem: yield* FileSystem.FileSystem,
+        path,
+        host: yield* ProviderHost.ProviderHost,
+        selfInvocation,
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: { T3_ACP_ANTIGRAVITY: "1" },
+            },
+          }).pipe(Effect.provideService(Crypto.Crypto, crypto)),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.succeed(undefined),
+      });
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        selfInvocation,
+        flavor: {
+          ...antigravityFlavor,
+          sessionModeForPolicy: (policy) => ({
+            _tag: "AcpUnsupportedRuntimeMode",
+            runtimeMode: policy.runtimeMode,
+          }),
+        },
+      });
+      const error = yield* adapter
+        .openSession({
+          threadId: ThreadId.make("thread-antigravity-mapper-refusal"),
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-mapper-refusal"),
+          modelSelection,
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "auto",
+            interactionMode: "default",
+            cwd: null,
+          }),
+        })
+        .pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterOpenSessionError");
+      assert.equal(protocolCause(error)?._tag, "ProviderAdapterProtocolError");
+      assert.include(protocolCause(error)?.message ?? "", "auto");
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect("refuses native turns and resumes on an open legacy session without a mode write", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const crypto = yield* Crypto.Crypto;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      const modeWrites: Array<string> = [];
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: { T3_ACP_ANTIGRAVITY: "1" },
+            },
+          }).pipe(
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.map((runtime): RuntimeService => ({
+              ...runtime,
+              setMode: (modeId) =>
+                Effect.sync(() => {
+                  modeWrites.push(modeId);
+                }).pipe(Effect.andThen(runtime.setMode(modeId))),
+            })),
+          ),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.succeed(undefined),
+      });
+      const threadId = ThreadId.make("thread-antigravity-native-turn");
+      const legacyPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: null,
+      });
+      const nativePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "native",
+        interactionMode: "default",
+        cwd: null,
+      });
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-antigravity-native-turn"),
+        modelSelection,
+        runtimePolicy: legacyPolicy,
+      });
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy: legacyPolicy,
+      });
+      assert.deepEqual(modeWrites, ["yolo"], "the legacy session configured Antigravity once");
+      const now = yield* DateTime.now;
+
+      const turnError = yield* session
+        .startTurn({
+          appThread: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project-antigravity-native-turn"),
+            title: "Antigravity native turn",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "native",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          threadId,
+          runId: RunId.make("run-antigravity-native-turn"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("attempt-antigravity-native-turn"),
+          rootNodeId: NodeId.make("node-antigravity-native-turn"),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-antigravity-native-turn"),
+            text: "hello",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy: nativePolicy,
+        })
+        .pipe(Effect.flip);
+      assert.equal(turnError._tag, "ProviderAdapterTurnStartError");
+      assert.equal(protocolCause(turnError)?._tag, "ProviderAdapterProtocolError");
+      assert.include(protocolCause(turnError)?.message ?? "", "native");
+
+      const resumeError = yield* session
+        .resumeThread({ providerThread, modelSelection, runtimePolicy: nativePolicy })
+        .pipe(Effect.flip);
+      assert.equal(
+        protocolCause(resumeError)?._tag ?? resumeError._tag,
+        "ProviderAdapterProtocolError",
+      );
+      assert.include(protocolCause(resumeError)?.message ?? resumeError.message ?? "", "native");
+      assert.deepEqual(modeWrites, ["yolo"], "neither refusal wrote a mode");
+
+      // A resume that carries no thread policy inherits the session's managed one.
+      const resumed = yield* session.resumeThread({ providerThread, modelSelection });
+      assert.equal(resumed.id, providerThread.id);
+      assert.isTrue(
+        modeWrites.every((mode) => mode === "yolo"),
+        "only the managed mode was ever written",
+      );
     }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

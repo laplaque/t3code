@@ -30,6 +30,7 @@ import {
   type RuntimeRequestId,
   type ThreadTokenUsageSnapshot,
   type ThreadId,
+  type RuntimeMode,
 } from "@t3tools/contracts";
 import { AgentScope, AgentScopeThreadId } from "@t3tools/shared/AgentScope";
 import { HTML_RENDER_TOOL_NAME } from "@t3tools/shared/htmlRender";
@@ -223,6 +224,24 @@ class AcpModelSelectionError extends Schema.TaggedError<AcpModelSelectionError>(
   }
 }
 
+/**
+ * A flavor's answer when a policy has no agent mode to map to. The adapter
+ * turns it into a typed failure instead of writing a stand-in mode.
+ */
+export interface AcpUnsupportedRuntimeMode {
+  readonly _tag: "AcpUnsupportedRuntimeMode";
+  readonly runtimeMode: RuntimeMode;
+}
+
+export const acpUnsupportedRuntimeMode = (runtimeMode: RuntimeMode): AcpUnsupportedRuntimeMode => ({
+  _tag: "AcpUnsupportedRuntimeMode",
+  runtimeMode,
+});
+
+const isAcpUnsupportedRuntimeMode = (
+  value: string | AcpUnsupportedRuntimeMode | undefined,
+): value is AcpUnsupportedRuntimeMode => typeof value === "object";
+
 export interface AcpAdapterV2Flavor {
   readonly promptFailure?: (cause: unknown) => OrchestrationV2ProviderFailure;
   readonly driver: ProviderDriverKind;
@@ -274,8 +293,8 @@ export interface AcpAdapterV2Flavor {
     readonly modelSelection: ModelSelection;
   }) => Effect.Effect<string | undefined, EffectAcpErrors.AcpError>;
   readonly sessionModeForPolicy?: (
-    policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
-  ) => string | undefined;
+    policy: ProviderAdapter.ProviderAdapterV2ManagedRuntimePolicy,
+  ) => string | undefined | AcpUnsupportedRuntimeMode;
   readonly clientFileSystem?: {
     readonly readTextFile: (
       request: EffectAcpSchema.ReadTextFileRequest,
@@ -1391,6 +1410,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
     openSession: Effect.fn("AcpAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
         const sessionScope = yield* Effect.scope;
+        const managedRuntimePolicy = yield* ProviderAdapter.requireManagedRuntimePolicy(
+          driver,
+          input.runtimePolicy,
+        );
         let itemIdentityVersion: 2 | undefined =
           input.initialProviderItemIdentityVersion ??
           (input.initialNativeThreadId === undefined ? 2 : undefined);
@@ -6634,7 +6657,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const configureSession = Effect.fnUntraced(function* (
           startResult: AcpSessionRuntime.AcpSessionRuntimeStartResult,
           modelSelection: ModelSelection,
-          runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2ManagedRuntimePolicy,
         ) {
           yield* Ref.set(activeSelection, null);
           const requestedModel = flavor.resolveModelId?.(modelSelection) ?? modelSelection.model;
@@ -6767,6 +6790,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             );
           }
           const policyMode = flavor.sessionModeForPolicy?.(runtimePolicy);
+          if (isAcpUnsupportedRuntimeMode(policyMode)) {
+            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+              driver,
+              detail: `runtime mode ${policyMode.runtimeMode} has no ${driver} session mode`,
+            });
+          }
           if (policyMode !== undefined) {
             yield* runtime.setMode(policyMode);
           }
@@ -6856,7 +6885,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           );
         });
 
-        yield* configureSession(started, input.modelSelection, input.runtimePolicy);
+        yield* configureSession(started, input.modelSelection, managedRuntimePolicy);
         yield* Ref.set(activeSelection, input.modelSelection);
         yield* Ref.set(activeInteractionMode, input.runtimePolicy.interactionMode);
         const createdAt = yield* DateTime.now;
@@ -7266,6 +7295,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 reason: "previous_turn_active",
               });
             }
+            const managedRuntimePolicy = yield* ProviderAdapter.requireManagedRuntimePolicy(
+              driver,
+              turnInput.runtimePolicy,
+            );
             useProviderThreadIdentity(turnInput.providerThread);
             // Session activation can itself invoke client fs/terminal methods.
             // Install the incoming thread policy before load/resume so those
@@ -7281,7 +7314,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               const activated = yield* activateSession(requestedSessionId, turnInput.threadId);
               yield* Ref.set(activeSessionId, activated.sessionId);
               yield* setActiveSessionSetup(activated);
-              yield* configureSession(activated, turnInput.modelSelection, turnInput.runtimePolicy);
+              yield* configureSession(activated, turnInput.modelSelection, managedRuntimePolicy);
               yield* Ref.set(activeSelection, turnInput.modelSelection);
               yield* Ref.set(activeInteractionMode, turnInput.runtimePolicy.interactionMode);
             } else {
@@ -7302,7 +7335,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 yield* configureSession(
                   currentSessionSetup,
                   turnInput.modelSelection,
-                  turnInput.runtimePolicy,
+                  managedRuntimePolicy,
                 );
                 yield* Ref.set(activeSelection, turnInput.modelSelection);
                 yield* Ref.set(activeInteractionMode, turnInput.runtimePolicy.interactionMode);
@@ -7814,6 +7847,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 Effect.gen(function* () {
                   yield* awaitRuntimeTeardown();
                   const sessionId = yield* nativeThreadId(driver, threadInput.providerThread);
+                  // Refused before any restart, load or resume could touch the agent.
+                  const nextRuntimePolicy = yield* ProviderAdapter.requireManagedRuntimePolicy(
+                    driver,
+                    threadInput.runtimePolicy ?? input.runtimePolicy,
+                  );
                   const previousItemIdentityVersion = itemIdentityVersion;
                   useProviderThreadIdentity(threadInput.providerThread);
                   const restorePreviousItemIdentity = Effect.sync(() => {
@@ -7837,7 +7875,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     yield* Ref.set(activeSessionId, activated.sessionId);
                     yield* setActiveSessionSetup(activated);
                     const nextSelection = threadInput.modelSelection ?? input.modelSelection;
-                    const nextRuntimePolicy = threadInput.runtimePolicy ?? input.runtimePolicy;
                     yield* configureSession(activated, nextSelection, nextRuntimePolicy);
                     yield* Ref.set(activeSelection, nextSelection);
                     yield* Ref.set(activeInteractionMode, nextRuntimePolicy.interactionMode);
