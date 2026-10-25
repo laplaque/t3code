@@ -1,7 +1,7 @@
 import { useComposerTypingGuard } from "./useComposerTypingGuard";
 import { insertAttachmentReferencesForDraft } from "./composerAttachmentReferences";
 import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
-import { runtimeModeConfig, runtimeModeOptions as runtimeModes } from "./runtimeModeConfig";
+import { resolveComposerRuntimeMode } from "./runtimeModeConfig";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useRightPanelStore } from "~/rightPanelStore";
@@ -45,7 +45,7 @@ import { serializeComposerFileLink } from "@t3tools/shared/composerTrigger";
 import { folderDropTarget, resolveDroppedFolderPath } from "./folderDrop";
 import { splitTransferredFiles } from "./workspaceFileDrop";
 import { createModelSelection, normalizeModelSlug } from "@t3tools/shared/model";
-import { USAGE_LIMITS_COMMAND } from "@t3tools/shared/usageLimits";
+import { isUsageLimitsCommand, USAGE_LIMITS_COMMAND } from "@t3tools/shared/usageLimits";
 import {
   memo,
   type ReactNode,
@@ -70,8 +70,10 @@ import {
   formatAssistantCitationForComposer,
   isPathSuggestionCurrent,
   extendReplacementRangeForTrailingSpace,
+  parseStandaloneComposerSlashCommand,
   replaceTextRange,
 } from "../../composer-logic";
+import { parseCodexFeedbackCommand } from "@t3tools/client-runtime/state/threads";
 import { DISCONNECTED_COMPOSER_PLACEHOLDER } from "../../composerPlaceholder";
 import {
   deriveComposerSendState,
@@ -304,8 +306,6 @@ function consumePasteAsTextShortcut(deadline: { current: number }): boolean {
   return armed;
 }
 
-const runtimeModeOptions = runtimeModes.map((mode) => ({ mode, ...runtimeModeConfig[mode] }));
-
 export interface ChatComposerHandle {
   focusAtEnd: () => void;
   focusAt: (cursor: number) => void;
@@ -356,6 +356,7 @@ export interface ChatComposerHandle {
     selectedModelSelection: ModelSelection;
     multipleModelSelections: ReadonlyArray<ModelSelection> | null;
     providerAvailable: boolean;
+    runtimeModeBlockReason: string | null;
     selectedProvider: ProviderDriverKind;
     selectedModel: string;
     selectedProviderModels: ReadonlyArray<ServerProvider["models"][number]>;
@@ -976,28 +977,48 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     : undefined;
   const resolvedCompactDisabledReason =
     compactDisabledReason ?? (noProviderAvailable ? "Compacting is unavailable right now" : null);
-  const supportedRuntimeModes = selectedProviderEntry?.snapshot.supportedRuntimeModes;
-  const compatibleRuntimeModeOptions =
-    supportedRuntimeModes && supportedRuntimeModes.length > 0
-      ? runtimeModeOptions.filter((option) => supportedRuntimeModes.includes(option.mode))
-      : runtimeModeOptions;
-  const compatibleRuntimeMode = compatibleRuntimeModeOptions.some(
-    (option) => option.mode === runtimeMode,
-  )
-    ? runtimeMode
-    : (compatibleRuntimeModeOptions[0]?.mode ?? runtimeMode);
+  // Every fanout selection must advertise native, and a selection whose instance is
+  // missing from the catalog cannot opt in. Managed rows follow the selected instance only.
+  const runtimeModeTargets = multipleModelSelections?.map(
+    (selection) =>
+      providerInstanceEntries.find((entry) => entry.instanceId === selection.instanceId)?.snapshot,
+  );
+  const {
+    options: compatibleRuntimeModeOptions,
+    selectedMode: compatibleRuntimeMode,
+    blockReason: runtimeModeBlockReason,
+  } = resolveComposerRuntimeMode({
+    mode: runtimeMode,
+    provider: selectedProviderEntry?.snapshot,
+    ...(runtimeModeTargets ? { targets: runtimeModeTargets } : {}),
+  });
 
   const providerSendBlockReason = getAntigravitySendBlockReason(
     selectedProviderEntry?.snapshot,
     selectedModel,
   );
+  // useComposerSend refuses an unavailable native turn itself; this gate only keeps the
+  // button usable for the submissions that never start one: a queued-message edit, typed
+  // feedback on the shown approval, the standalone local commands, and /usage-limits where
+  // ChatView offers the local answer (the callback is present only then).
+  const runtimeModeSendBlockReason =
+    runtimeModeBlockReason !== null &&
+    !isEditingQueuedMessage &&
+    pendingApprovals.find((approval) => !heldRequestIds.has(approval.requestId))
+      ?.supportsFeedback !== true &&
+    parseStandaloneComposerSlashCommand(prompt) === null &&
+    (selectedProvider !== "codex" || parseCodexFeedbackCommand(prompt) === null) &&
+    (props.onUsageLimitsCommand === undefined || !isUsageLimitsCommand(prompt))
+      ? runtimeModeBlockReason
+      : null;
   const sendDisabledReason =
     externalSendDisabledReason ??
     (multipleModelSelections?.length === 0 ? "Select at least one model." : null) ??
     (activePendingProgress
       ? attachmentBlockReason
       : (attachmentBlockReason ??
-        (multipleModelSelections === null ? providerSendBlockReason : null)));
+        (multipleModelSelections === null ? providerSendBlockReason : null) ??
+        runtimeModeSendBlockReason));
   const isSendDisabled = sendDisabledReason !== null;
   const selectedProviderStatus = selectedProviderEntry?.snapshot ?? null;
   const compactCommandAvailable = providerSupportsManualCompaction(selectedProviderEntry);
@@ -3287,6 +3308,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         providerAvailable:
           multipleModelSelections !== null ||
           (!noProviderAvailable && providerSendBlockReason === null),
+        runtimeModeBlockReason,
         selectedProvider,
         selectedModel,
         selectedProviderModels,
@@ -3352,6 +3374,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       routeKind,
       noProviderAvailable,
       providerSendBlockReason,
+      runtimeModeBlockReason,
       selectedPromptEffort,
       selectedProvider,
       selectedProviderModels,
