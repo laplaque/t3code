@@ -23,6 +23,7 @@ import {
 } from "@t3tools/contracts";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { createModelSelection } from "@t3tools/shared/model";
+import { USAGE_LIMITS_COMMAND } from "@t3tools/shared/usageLimits";
 import { AsyncResult } from "effect/reactivity";
 import { type RefObject, useImperativeHandle, useRef, useState } from "react";
 import { describe, expect, it, vi } from "vite-plus/test";
@@ -155,6 +156,13 @@ const settings: UnifiedSettings = {
 const providersAfterCapabilityLoss = providersWithOptIn.map((snapshot) =>
   snapshot.instanceId === OPTED_IN ? provider(OPTED_IN, ALL_MANAGED) : snapshot,
 );
+// The same catalog once Limits holds data for the managed-only instance: the server then
+// advertises /usage-limits on it, as withUsageLimitsCommands does.
+const providersWithUsageLimits = providersWithOptIn.map((snapshot) =>
+  snapshot.instanceId === MANAGED_ONLY
+    ? { ...snapshot, slashCommands: [USAGE_LIMITS_COMMAND] }
+    : snapshot,
+);
 
 interface Spies {
   readonly runtimeModeWrites: RuntimeMode[];
@@ -166,6 +174,8 @@ interface Spies {
   readonly queuedEdits: unknown[];
   readonly interactionModes: unknown[];
   readonly feedbackSubmissions: unknown[];
+  readonly usageLimitsOpened: unknown[];
+  readonly usageLimitsAutocomplete: unknown[];
 }
 
 interface HarnessHandles {
@@ -191,6 +201,7 @@ interface HarnessProps {
   readonly planMode?: boolean;
   readonly proposedPlan?: boolean;
   readonly providerThreadStarted?: boolean;
+  readonly usageLimits?: boolean;
   readonly mountComposer?: boolean;
   readonly handles: RefObject<HarnessHandles | null>;
   readonly spies: Spies;
@@ -374,6 +385,19 @@ function Harness(props: HarnessProps) {
         replaceOptions: true,
       });
   };
+  // Local usage data for the selected instance. ChatView derives the composer's command
+  // callback and the hook's local inputs from the same facts; the lab adds no attachments or
+  // context, so the data alone decides eligibility. The autocomplete callback is spied apart
+  // from the panel so a typed submission is known to have gone through the send hook.
+  const usageLimitsAvailable = props.usageLimits === true;
+  const openUsageLimits = () => {
+    spies.usageLimitsOpened.push(true);
+    return true;
+  };
+  const onUsageLimitsCommand = () => {
+    spies.usageLimitsAutocomplete.push(true);
+    openUsageLimits();
+  };
 
   const { onSend } = useComposerSend({
     environmentId,
@@ -418,9 +442,9 @@ function Harness(props: HarnessProps) {
     keepFullHistory: false,
     resumeCompactionTokens: null,
     showPlanFollowUpPrompt: props.proposedPlan === true,
-    usageLimitsKey: null,
-    usageLimitsOffered: false,
-    openUsageLimits: () => false,
+    usageLimitsKey: usageLimitsAvailable ? ids.routeThreadKey : null,
+    usageLimitsOffered: usageLimitsAvailable,
+    openUsageLimits,
     clearUsageLimitsFor: noop,
     needsLoadBalancing: false,
     loadBalancing: { pending: false, environmentId: null } as never,
@@ -513,6 +537,7 @@ function Harness(props: HarnessProps) {
       resumeCompactionTokens={null}
       keepFullHistory={false}
       onToggleKeepFullHistory={noop}
+      onUsageLimitsCommand={usageLimitsAvailable ? onUsageLimitsCommand : undefined}
       activeTaskSteps={null}
       threadSyncPhase={null}
       environmentUnavailable={null}
@@ -606,6 +631,8 @@ function newSpies(): Spies {
     queuedEdits: [],
     interactionModes: [],
     feedbackSubmissions: [],
+    usageLimitsOpened: [],
+    usageLimitsAutocomplete: [],
   };
 }
 
@@ -1119,6 +1146,64 @@ describe("existing non-turn actions stay available while native is unavailable",
     expect(fixture.spies.feedbackSubmissions.length).toBeGreaterThanOrEqual(2);
     await expect.poll(fixture.draftPrompt).toBe("");
     expect(fixture.spies.threadErrors).not.toContain(SINGLE_BLOCK_REASON);
+  });
+});
+
+describe("local /usage-limits", () => {
+  const USAGE_LIMITS_HINT = USAGE_LIMITS_COMMAND.description;
+
+  it("answers typed /usage-limits locally through Enter and the button while native is unavailable", async () => {
+    await setup();
+    await using fixture = await mount("local usage limits", {
+      routeKind: "server",
+      initialRuntimeMode: "native",
+      initialInstanceId: MANAGED_ONLY,
+      providers: providersWithUsageLimits,
+      usageLimits: true,
+    });
+    // Typing opens the suggestion; Escape dismisses it so Enter submits the typed text
+    // rather than picking the suggestion through its own callback.
+    await fixture.typePrompt("/usage-limits");
+    await expect.element(page.getByText(USAGE_LIMITS_HINT)).toBeVisible();
+    await userEvent.keyboard("{Escape}");
+    await expect.element(page.getByText(USAGE_LIMITS_HINT)).not.toBeInTheDocument();
+    expect(fixture.draftPrompt()).toBe("/usage-limits");
+    await expect.element(sendButton(fixture.screen)).toBeEnabled();
+    await userEvent.keyboard("{Enter}");
+    await expect.poll(() => fixture.spies.usageLimitsOpened).toHaveLength(1);
+    await expect.poll(fixture.draftPrompt).toBe("");
+
+    await fixture.typePrompt("/usage-limits");
+    await userEvent.keyboard("{Escape}");
+    await expect.element(page.getByText(USAGE_LIMITS_HINT)).not.toBeInTheDocument();
+    await userEvent.click(sendButton(fixture.screen));
+    await expect.poll(() => fixture.spies.usageLimitsOpened).toHaveLength(2);
+    await expect.poll(fixture.draftPrompt).toBe("");
+    expect(fixture.spies.usageLimitsAutocomplete).toEqual([]);
+    expect(state.commands).toEqual([]);
+    expect(fixture.spies.persisted).toEqual([]);
+    expect(fixture.spies.threadErrors).not.toContain(SINGLE_BLOCK_REASON);
+  });
+
+  it("keeps refusing typed /usage-limits when no local usage data is offered", async () => {
+    await setup();
+    await using fixture = await mount("usage limits without data", {
+      routeKind: "server",
+      initialRuntimeMode: "native",
+      initialInstanceId: MANAGED_ONLY,
+    });
+    await fixture.typePrompt("/usage-limits");
+    await userEvent.keyboard("{Escape}");
+    const send = fixture.screen.getByRole("button", { name: SINGLE_BLOCK_REASON });
+    await expect.element(send).toBeDisabled();
+    await userEvent.keyboard("{Enter}");
+    await userEvent.click(send, { force: true });
+    await act(() => fixture.handles.current!.send());
+    expect(fixture.spies.threadErrors).toEqual([SINGLE_BLOCK_REASON]);
+    expect(fixture.spies.usageLimitsOpened).toEqual([]);
+    expect(state.commands).toEqual([]);
+    expect(fixture.spies.persisted).toEqual([]);
+    expect(fixture.draftPrompt()).toBe("/usage-limits");
   });
 });
 
