@@ -101,6 +101,14 @@ export function useComposerResume(input: ComposerResumeInput) {
       return;
     }
     const threadId = activeThread.id;
+    // Resume persists the thread's settings and starts a turn; an unavailable native
+    // selection is refused before either, with no busy state to unwind.
+    const runtimeModeBlockReason =
+      composerRef.current?.getSendContext().runtimeModeBlockReason ?? null;
+    if (runtimeModeBlockReason !== null) {
+      setThreadError(threadId, runtimeModeBlockReason);
+      return;
+    }
     sendInFlightRef.current = true;
     setResumingThreadKeys((current) => new Set(current).add(routeThreadKey));
     setThreadError(threadId, null);

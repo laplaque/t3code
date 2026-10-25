@@ -1,7 +1,7 @@
 import { useComposerTypingGuard } from "./useComposerTypingGuard";
 import { insertAttachmentReferencesForDraft } from "./composerAttachmentReferences";
 import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
-import { runtimeModeConfig, runtimeModeOptions as runtimeModes } from "./runtimeModeConfig";
+import { resolveComposerRuntimeMode } from "./runtimeModeConfig";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useRightPanelStore } from "~/rightPanelStore";
@@ -304,8 +304,6 @@ function consumePasteAsTextShortcut(deadline: { current: number }): boolean {
   return armed;
 }
 
-const runtimeModeOptions = runtimeModes.map((mode) => ({ mode, ...runtimeModeConfig[mode] }));
-
 export interface ChatComposerHandle {
   focusAtEnd: () => void;
   focusAt: (cursor: number) => void;
@@ -356,6 +354,7 @@ export interface ChatComposerHandle {
     selectedModelSelection: ModelSelection;
     multipleModelSelections: ReadonlyArray<ModelSelection> | null;
     providerAvailable: boolean;
+    runtimeModeBlockReason: string | null;
     selectedProvider: ProviderDriverKind;
     selectedModel: string;
     selectedProviderModels: ReadonlyArray<ServerProvider["models"][number]>;
@@ -976,16 +975,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     : undefined;
   const resolvedCompactDisabledReason =
     compactDisabledReason ?? (noProviderAvailable ? "Compacting is unavailable right now" : null);
-  const supportedRuntimeModes = selectedProviderEntry?.snapshot.supportedRuntimeModes;
-  const compatibleRuntimeModeOptions =
-    supportedRuntimeModes && supportedRuntimeModes.length > 0
-      ? runtimeModeOptions.filter((option) => supportedRuntimeModes.includes(option.mode))
-      : runtimeModeOptions;
-  const compatibleRuntimeMode = compatibleRuntimeModeOptions.some(
-    (option) => option.mode === runtimeMode,
-  )
-    ? runtimeMode
-    : (compatibleRuntimeModeOptions[0]?.mode ?? runtimeMode);
+  // Every fanout selection must advertise native, and a selection whose instance is
+  // missing from the catalog cannot opt in. Managed rows follow the selected instance only.
+  const runtimeModeTargets = multipleModelSelections?.map(
+    (selection) =>
+      providerInstanceEntries.find((entry) => entry.instanceId === selection.instanceId)?.snapshot,
+  );
+  const {
+    options: compatibleRuntimeModeOptions,
+    selectedMode: compatibleRuntimeMode,
+    blockReason: runtimeModeBlockReason,
+  } = resolveComposerRuntimeMode({
+    mode: runtimeMode,
+    provider: selectedProviderEntry?.snapshot,
+    ...(runtimeModeTargets ? { targets: runtimeModeTargets } : {}),
+  });
 
   const providerSendBlockReason = getAntigravitySendBlockReason(
     selectedProviderEntry?.snapshot,
@@ -997,7 +1001,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     (activePendingProgress
       ? attachmentBlockReason
       : (attachmentBlockReason ??
-        (multipleModelSelections === null ? providerSendBlockReason : null)));
+        (multipleModelSelections === null ? providerSendBlockReason : null) ??
+        runtimeModeBlockReason));
   const isSendDisabled = sendDisabledReason !== null;
   const selectedProviderStatus = selectedProviderEntry?.snapshot ?? null;
   const compactCommandAvailable = providerSupportsManualCompaction(selectedProviderEntry);
@@ -3287,6 +3292,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         providerAvailable:
           multipleModelSelections !== null ||
           (!noProviderAvailable && providerSendBlockReason === null),
+        runtimeModeBlockReason,
         selectedProvider,
         selectedModel,
         selectedProviderModels,
@@ -3352,6 +3358,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       routeKind,
       noProviderAvailable,
       providerSendBlockReason,
+      runtimeModeBlockReason,
       selectedPromptEffort,
       selectedProvider,
       selectedProviderModels,

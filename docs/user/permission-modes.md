@@ -18,6 +18,18 @@ and modes you choose in a draft keep their permissions.
 Approve or reject requests in the conversation to let the agent continue. Permission modes do
 not prevent the agent from asking questions about the task.
 
+## Use harness policy
+
+This thread option appears only when the selected provider supports it. The provider's own
+permission and sandbox configuration remains responsible for access; its approval requests
+still apply. It does not grant Full access.
+
+If a provider change makes the option unavailable, your selection is retained and new sends
+are blocked. Choose a compatible provider or explicitly select another permission mode.
+
+Availability depends on provider support. The web and desktop control does not by itself
+enable native-policy support in a provider or add the option to project defaults.
+
 ## Provider differences
 
 Providers enforce permissions differently. Some read-only actions can proceed in **Supervised**.

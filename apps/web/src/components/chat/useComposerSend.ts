@@ -477,6 +477,13 @@ export function useComposerSend(input: ComposerSendInput) {
       notifyDirectAnnotationAttached();
       return;
     }
+    // A retained native selection the provider cannot run never starts a turn from here:
+    // refusing before the draft is consumed keeps the prompt and every selected model intact.
+    if (sendCtx.runtimeModeBlockReason !== null) {
+      notifyDirectAnnotationAttached();
+      setThreadError(activeThread.id, sendCtx.runtimeModeBlockReason);
+      return;
+    }
     const multipleModelSelections = sendCtx.multipleModelSelections;
     const approvalFeedbackTarget = pendingApprovalsRef.current.find(
       (approval) =>

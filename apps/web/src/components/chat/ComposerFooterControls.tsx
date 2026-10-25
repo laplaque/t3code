@@ -22,10 +22,14 @@ import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { ContextWindowMeter, ContextWindowMeterPlaceholder } from "./ContextWindowMeter";
 import { resolveModelPickerSelectedModel } from "./ModelPickerContent";
 import { ProviderModelPicker } from "./ProviderModelPicker";
-import { runtimeModeConfig } from "./runtimeModeConfig";
+import { runtimeModeConfig, unavailableNativeRuntimeModeOption } from "./runtimeModeConfig";
 import { useComposerMenuState } from "./useComposerMenuState";
 
-export type RuntimeModeOption = { mode: RuntimeMode } & (typeof runtimeModeConfig)[RuntimeMode];
+export type RuntimeModeOption = {
+  mode: RuntimeMode;
+  /** A retained selection the current provider cannot run; shown, never re-selectable. */
+  disabled?: boolean;
+} & (typeof runtimeModeConfig)[RuntimeMode];
 const supervisedRuntimeModeOption = {
   mode: "approval-required" as const,
   ...runtimeModeConfig["approval-required"],
@@ -45,7 +49,9 @@ export const ComposerFooterModeControls = memo(function ComposerFooterModeContro
   const [open, setOpen] = useComposerMenuState(props.hidden);
   const runtimeModeOption =
     props.runtimeModeOptions.find((option) => option.mode === props.runtimeMode) ??
-    supervisedRuntimeModeOption;
+    (props.runtimeMode === "native"
+      ? unavailableNativeRuntimeModeOption
+      : supervisedRuntimeModeOption);
   const RuntimeModeIcon = runtimeModeOption.icon;
   const interactionModeTooltip =
     props.interactionMode === "plan"
@@ -120,6 +126,7 @@ export const ComposerFooterModeControls = memo(function ComposerFooterModeContro
                 <SelectItem
                   key={option.mode}
                   value={option.mode}
+                  disabled={option.disabled}
                   hideIndicator
                   className="min-w-64"
                 >
