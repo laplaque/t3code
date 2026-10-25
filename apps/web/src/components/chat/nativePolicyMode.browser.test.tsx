@@ -7,10 +7,13 @@ import {
   DEFAULT_UNIFIED_SETTINGS,
   EnvironmentId,
   type ModelSelection,
+  PlanId,
   ProjectId,
   type ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderInstanceId,
+  type ProviderInteractionMode,
+  ProviderThreadId,
   RunId,
   type RuntimeMode,
   RuntimeRequestId,
@@ -40,7 +43,7 @@ vi.mock(import("../../state/use-orchestration-command"), async (importOriginal) 
     ...(await importOriginal()),
     useOrchestrationCommand: ((command: { readonly label: string }) => async (value: unknown) => {
       state.commands.push({ label: command.label, value });
-      return AsyncResult.success(undefined);
+      return AsyncResult.success({ sequence: 1, feedbackId: "lab-feedback" });
     }) as never,
   };
 });
@@ -65,7 +68,11 @@ import {
   type PendingUserInputDraftAnswer,
 } from "../../pendingUserInput";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
-import type { PendingApproval, PendingUserInput } from "../../session-logic";
+import type {
+  LatestProposedPlanState,
+  PendingApproval,
+  PendingUserInput,
+} from "../../session-logic";
 import type { SessionPhase } from "../../types";
 import { ChatComposer, type ChatComposerHandle } from "./ChatComposer";
 import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
@@ -94,6 +101,7 @@ const OPTED_IN = ProviderInstanceId.make("lab_opted_in");
 const MANAGED_ONLY = ProviderInstanceId.make("lab_managed_only");
 const ABSENT_LIST = ProviderInstanceId.make("lab_absent_list");
 const EMPTY_LIST = ProviderInstanceId.make("lab_empty_list");
+const CODEX_MANAGED = ProviderInstanceId.make("lab_codex_managed");
 const ALL_MANAGED: ReadonlyArray<RuntimeMode> = [
   "approval-required",
   "auto-accept-edits",
@@ -104,10 +112,11 @@ const ALL_MANAGED: ReadonlyArray<RuntimeMode> = [
 function provider(
   instanceId: ProviderInstanceId,
   supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
+  kind: ProviderDriverKind = driver,
 ): ServerProvider {
   return {
     instanceId,
-    driver,
+    driver: kind,
     displayName: instanceId,
     enabled: true,
     installed: true,
@@ -130,12 +139,16 @@ const providersWithOptIn = [
   provider(MANAGED_ONLY, ["approval-required", "full-access"]),
   provider(ABSENT_LIST, undefined),
   provider(EMPTY_LIST, []),
+  provider(CODEX_MANAGED, ["approval-required", "full-access"], ProviderDriverKind.make("codex")),
 ];
 // An instance that is not a driver default counts as disabled until settings enable it.
 const settings: UnifiedSettings = {
   ...DEFAULT_UNIFIED_SETTINGS,
   providerInstances: Object.fromEntries(
-    providersWithOptIn.map((snapshot) => [snapshot.instanceId, { driver, enabled: true }]),
+    providersWithOptIn.map((snapshot) => [
+      snapshot.instanceId,
+      { driver: snapshot.driver, enabled: true },
+    ]),
   ),
 };
 // The same instance after its capability advertisement loses native.
@@ -150,6 +163,9 @@ interface Spies {
   readonly advanced: unknown[];
   readonly approvals: unknown[];
   readonly interrupts: unknown[];
+  readonly queuedEdits: unknown[];
+  readonly interactionModes: unknown[];
+  readonly feedbackSubmissions: unknown[];
 }
 
 interface HarnessHandles {
@@ -171,6 +187,10 @@ interface HarnessProps {
   readonly resumableRunId?: RunId | null;
   readonly approval?: PendingApproval | null;
   readonly question?: PendingUserInput | null;
+  readonly queuedEdit?: boolean;
+  readonly planMode?: boolean;
+  readonly proposedPlan?: boolean;
+  readonly providerThreadStarted?: boolean;
   readonly mountComposer?: boolean;
   readonly handles: RefObject<HarnessHandles | null>;
   readonly spies: Spies;
@@ -192,6 +212,7 @@ function threadShell(
   ids: ReturnType<typeof idsFor>,
   instanceId: ProviderInstanceId,
   runtimeMode: RuntimeMode,
+  providerThreadStarted: boolean,
 ): EnvironmentThreadShell {
   const shell: Partial<EnvironmentThreadShell> = {
     environmentId,
@@ -204,7 +225,9 @@ function threadShell(
     interactionMode: "default",
     branch: "main",
     worktreePath: null,
-    activeProviderThreadId: null,
+    activeProviderThreadId: providerThreadStarted
+      ? ProviderThreadId.make("lab-provider-thread")
+      : null,
     latestRun: null,
     runtime: null,
     latestUserMessageAt: null,
@@ -264,7 +287,25 @@ function Harness(props: HarnessProps) {
   const [fanout, setFanout] = useState<ReadonlyArray<ModelSelection> | null>(props.fanout ?? null);
   const isServerThread = props.routeKind === "server";
   const composerDraftTarget = isServerThread ? ids.threadRef : ids.draftId;
-  const activeThread = threadShell(ids, props.initialInstanceId, runtimeMode);
+  const activeThread = threadShell(
+    ids,
+    props.initialInstanceId,
+    runtimeMode,
+    props.providerThreadStarted === true,
+  );
+  const activeProposedPlan: LatestProposedPlanState | null = props.proposedPlan
+    ? {
+        id: PlanId.make("lab-plan"),
+        createdAt: "2026-10-24T00:00:00.000Z",
+        updatedAt: "2026-10-24T00:00:00.000Z",
+        runId: null,
+        planMarkdown: "# Plan\n\n1. Keep the policy.",
+        status: "active",
+      }
+    : null;
+  const composerSettings: UnifiedSettings = props.planMode
+    ? { ...settings, planModeEnabled: true }
+    : settings;
   const draftThread: DraftSessionState | null = isServerThread
     ? null
     : {
@@ -304,9 +345,19 @@ function Harness(props: HarnessProps) {
   const onRespondToApproval = async (
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
+    feedback?: string,
   ) => {
-    spies.approvals.push({ requestId, decision });
+    spies.approvals.push({ requestId, decision, feedback });
     return AsyncResult.success({ sequence: 1 });
+  };
+  const handleInteractionModeChange = (mode: ProviderInteractionMode) => {
+    spies.interactionModes.push(mode);
+  };
+  const queuedRunEdit = {
+    isEditing: props.queuedEdit === true,
+    saveEdit: async (draft: { readonly prompt: string }) => {
+      spies.queuedEdits.push(draft.prompt);
+    },
   };
   const onInterrupt = () => {
     spies.interrupts.push(true);
@@ -335,7 +386,7 @@ function Harness(props: HarnessProps) {
     activeThreadBranch: "main",
     activeProject: project,
     activeProjectDefaultModelSelection: null,
-    activeProposedPlan: null,
+    activeProposedPlan,
     activeMessageCount: 0,
     isServerThread,
     isLocalDraftThread: !isServerThread,
@@ -354,7 +405,7 @@ function Harness(props: HarnessProps) {
     composerFilesRef,
     composerTerminalContextsRef,
     feedbackUploadsInFlightRef,
-    queuedRunEdit: { isEditing: false, saveEdit: async () => {} } as never,
+    queuedRunEdit: queuedRunEdit as never,
     isConnecting: false,
     isRevertingCheckpoint: false,
     threadDetailLoading: false,
@@ -366,7 +417,7 @@ function Harness(props: HarnessProps) {
     panelAnimationDurationMs: 0,
     keepFullHistory: false,
     resumeCompactionTokens: null,
-    showPlanFollowUpPrompt: false,
+    showPlanFollowUpPrompt: props.proposedPlan === true,
     usageLimitsKey: null,
     usageLimitsOffered: false,
     openUsageLimits: () => false,
@@ -386,12 +437,14 @@ function Harness(props: HarnessProps) {
     setDockedDraftHeroThreadKey: noop,
     setSetupQueueSendThreadKey: noop,
     setOptimisticUserMessages: noop,
-    setFeedbackSubmissionsByThreadKey: noop,
+    setFeedbackSubmissionsByThreadKey: (update) => {
+      spies.feedbackSubmissions.push(update);
+    },
     setThreadError,
     setKeepFullHistory: noop,
     anchorNewTurn: noop,
     acknowledgeActiveThreadWoke: noop,
-    handleInteractionModeChange: noop,
+    handleInteractionModeChange,
     handleNewThreadInActiveProject: noop,
     persistThreadSettingsForNextTurn,
   });
@@ -474,8 +527,8 @@ function Harness(props: HarnessProps) {
       activePendingDraftAnswers={draftAnswers}
       activePendingQuestionIndex={0}
       respondingRequestIds={[]}
-      showPlanFollowUpPrompt={false}
-      activeProposedPlan={null}
+      showPlanFollowUpPrompt={props.proposedPlan === true}
+      activeProposedPlan={activeProposedPlan}
       activeTasksProgress={null}
       activeThreadModelSelection={createModelSelection(props.initialInstanceId, LAB_MODEL)}
       reportedModelSelection={null}
@@ -485,7 +538,7 @@ function Harness(props: HarnessProps) {
       compactDisabled
       compactDisabledReason={null}
       resolvedTheme="light"
-      settings={settings}
+      settings={composerSettings}
       keybindings={DEFAULT_RESOLVED_KEYBINDINGS}
       terminalOpen={false}
       gitCwd={null}
@@ -514,7 +567,7 @@ function Harness(props: HarnessProps) {
       onPageScrollKeyDown={noop}
       onPageScrollKeyUp={noop}
       onPageScrollRelease={noop}
-      editingQueuedAttachments={null}
+      editingQueuedAttachments={props.queuedEdit ? [] : null}
       onRemoveEditingQueuedAttachment={noop}
       onCompactContext={noop}
       onSend={onSend}
@@ -532,7 +585,7 @@ function Harness(props: HarnessProps) {
       getModelDisabledReason={() => null}
       toggleInteractionMode={noop}
       handleRuntimeModeChange={handleRuntimeModeChange}
-      handleInteractionModeChange={noop}
+      handleInteractionModeChange={handleInteractionModeChange}
       focusComposer={noop}
       scheduleComposerFocus={noop}
       setThreadError={setThreadError}
@@ -550,6 +603,9 @@ function newSpies(): Spies {
     advanced: [],
     approvals: [],
     interrupts: [],
+    queuedEdits: [],
+    interactionModes: [],
+    feedbackSubmissions: [],
   };
 }
 
@@ -866,6 +922,11 @@ describe("multiple models", () => {
     await expect
       .element(fixture.screen.getByRole("button", { name: "Submit message" }))
       .toBeEnabled();
+    // The send passes the native check; the test environment then stops it at the existing
+    // server capability check, which is not what this scenario is about.
+    await act(() => fixture.handles.current!.send());
+    expect(fixture.spies.threadErrors).not.toContain(FANOUT_BLOCK_REASON);
+    expect(fixture.draftPrompt()).toBe("Fan out on policy");
   });
 });
 
@@ -957,6 +1018,162 @@ describe("pending requests and interrupt stay usable", () => {
     await userEvent.click(fixture.screen.getByRole("button", { name: "Stop generation" }));
     expect(fixture.spies.interrupts).toHaveLength(1);
     expect(state.commands).toEqual([]);
+  });
+});
+
+const UPLOAD_FEEDBACK = "environment-data:commands:thread:upload-feedback";
+const sendButton = (screen: Awaited<ReturnType<typeof mount>>["screen"]) =>
+  screen.getByRole("button", { name: /^(Submit|Queue|Steer) message$|^Update queued message$/ });
+
+describe("existing non-turn actions stay available while native is unavailable", () => {
+  it("sends typed decline feedback for a pending approval that accepts it and starts no turn", async () => {
+    await setup();
+    const approval: PendingApproval = {
+      requestId: RuntimeRequestId.make("approval-feedback"),
+      requestKind: "command",
+      createdAt: "2026-10-24T00:00:00.000Z",
+      detail: "rm -rf build",
+      responseCapability: "live",
+      supportsFeedback: true,
+    };
+    await using fixture = await mount("typed approval feedback", {
+      routeKind: "server",
+      initialRuntimeMode: "native",
+      initialInstanceId: MANAGED_ONLY,
+      approval,
+      phase: "running",
+    });
+    await fixture.typePrompt("Skip the deletion, the build directory is still needed");
+    const send = sendButton(fixture.screen);
+    await expect.element(send).toBeEnabled();
+    await userEvent.click(send);
+    await expect
+      .poll(() => fixture.spies.approvals)
+      .toEqual([
+        {
+          requestId: approval.requestId,
+          decision: "decline",
+          feedback: "Skip the deletion, the build directory is still needed",
+        },
+      ]);
+    await expect.poll(fixture.draftPrompt).toBe("");
+    expect(state.commands).toEqual([]);
+    expect(fixture.spies.threadErrors).not.toContain(SINGLE_BLOCK_REASON);
+  });
+
+  it("saves a queued-message edit through the existing edit path and starts no turn", async () => {
+    await setup();
+    await using fixture = await mount("queued edit", {
+      routeKind: "server",
+      initialRuntimeMode: "native",
+      initialInstanceId: MANAGED_ONLY,
+      queuedEdit: true,
+    });
+    await fixture.typePrompt("Updated queued instructions");
+    const send = sendButton(fixture.screen);
+    await expect.element(send).toBeEnabled();
+    await userEvent.click(send);
+    await expect.poll(() => fixture.spies.queuedEdits).toEqual(["Updated queued instructions"]);
+    expect(state.commands).toEqual([]);
+    expect(fixture.spies.persisted).toEqual([]);
+  });
+
+  it("keeps standalone /plan and /default as local mode changes", async () => {
+    await setup();
+    await using fixture = await mount("standalone slash", {
+      routeKind: "server",
+      initialRuntimeMode: "native",
+      initialInstanceId: MANAGED_ONLY,
+      planMode: true,
+    });
+    await fixture.typePrompt("/plan");
+    await expect.element(sendButton(fixture.screen)).toBeEnabled();
+    await act(() => fixture.handles.current!.send());
+    await expect.poll(() => fixture.spies.interactionModes).toEqual(["plan"]);
+    await expect.poll(fixture.draftPrompt).toBe("");
+
+    await fixture.typePrompt("/default");
+    await act(() => fixture.handles.current!.send());
+    await expect.poll(() => fixture.spies.interactionModes).toEqual(["plan", "default"]);
+    expect(state.commands).toEqual([]);
+    expect(fixture.spies.threadErrors).not.toContain(SINGLE_BLOCK_REASON);
+  });
+
+  it("uploads Codex feedback through its existing boundary and starts no turn", async () => {
+    await setup();
+    await using fixture = await mount("codex feedback", {
+      routeKind: "server",
+      initialRuntimeMode: "native",
+      initialInstanceId: CODEX_MANAGED,
+      providerThreadStarted: true,
+    });
+    await fixture.typePrompt("/feedback The diff view lost my scroll position");
+    await expect.element(sendButton(fixture.screen)).toBeEnabled();
+    await act(() => fixture.handles.current!.send());
+    await expect
+      .poll(() => state.commands.map((command) => command.label))
+      .toEqual([UPLOAD_FEEDBACK]);
+    expect(state.commands[0]?.value).toMatchObject({
+      input: { threadId: fixture.ids.threadId, reason: "The diff view lost my scroll position" },
+    });
+    expect(fixture.spies.feedbackSubmissions.length).toBeGreaterThanOrEqual(2);
+    await expect.poll(fixture.draftPrompt).toBe("");
+    expect(fixture.spies.threadErrors).not.toContain(SINGLE_BLOCK_REASON);
+  });
+});
+
+describe("plan follow-ups", () => {
+  it("refuses an unsupported native plan follow-up before the draft is consumed", async () => {
+    await setup();
+    await using fixture = await mount("refused plan follow-up", {
+      routeKind: "server",
+      initialRuntimeMode: "native",
+      initialInstanceId: MANAGED_ONLY,
+      planMode: true,
+      proposedPlan: true,
+    });
+    await fixture.typePrompt("Tighten the second step");
+    await act(() => fixture.handles.current!.send());
+    expect(fixture.spies.threadErrors).toEqual([SINGLE_BLOCK_REASON]);
+    expect(state.commands).toEqual([]);
+    expect(fixture.spies.persisted).toEqual([]);
+    expect(fixture.draftPrompt()).toBe("Tighten the second step");
+  });
+
+  it("treats /plan as a plan follow-up first, so it is refused rather than switching modes", async () => {
+    await setup();
+    await using fixture = await mount("plan follow-up precedence", {
+      routeKind: "server",
+      initialRuntimeMode: "native",
+      initialInstanceId: MANAGED_ONLY,
+      planMode: true,
+      proposedPlan: true,
+    });
+    await fixture.typePrompt("/plan");
+    await act(() => fixture.handles.current!.send());
+    expect(fixture.spies.threadErrors).toEqual([SINGLE_BLOCK_REASON]);
+    expect(fixture.spies.interactionModes).toEqual([]);
+    expect(state.commands).toEqual([]);
+    expect(fixture.draftPrompt()).toBe("/plan");
+  });
+
+  it("sends a plan follow-up normally when the selected instance supports native", async () => {
+    await setup();
+    await using fixture = await mount("allowed plan follow-up", {
+      routeKind: "server",
+      initialRuntimeMode: "native",
+      initialInstanceId: OPTED_IN,
+      planMode: true,
+      proposedPlan: true,
+    });
+    await fixture.typePrompt("Tighten the second step");
+    await act(() => fixture.handles.current!.send());
+    await expect.poll(() => state.commands.map((command) => command.label)).toEqual([START_TURN]);
+    expect(state.commands[0]?.value).toMatchObject({
+      input: { runtimeMode: "native", interactionMode: "plan" },
+    });
+    expect(fixture.spies.persisted).toHaveLength(1);
+    await expect.poll(fixture.draftPrompt).toBe("");
   });
 });
 

@@ -477,18 +477,17 @@ export function useComposerSend(input: ComposerSendInput) {
       notifyDirectAnnotationAttached();
       return;
     }
-    // A retained native selection the provider cannot run never starts a turn from here:
-    // refusing before the draft is consumed keeps the prompt and every selected model intact.
-    if (sendCtx.runtimeModeBlockReason !== null) {
-      notifyDirectAnnotationAttached();
-      setThreadError(activeThread.id, sendCtx.runtimeModeBlockReason);
-      return;
-    }
     const multipleModelSelections = sendCtx.multipleModelSelections;
     const approvalFeedbackTarget = pendingApprovalsRef.current.find(
       (approval) =>
         approval.supportsFeedback && approval.requestId === sendCtx.shownPendingApprovalIds[0],
     );
+    // A fanout only ever starts provider turns, so an unavailable native selection is refused
+    // ahead of the server capability check: that is the reason the user can act on.
+    if (multipleModelSelections !== null && sendCtx.runtimeModeBlockReason !== null) {
+      setThreadError(activeThread.id, sendCtx.runtimeModeBlockReason);
+      return;
+    }
     const multipleModelBlock =
       multipleModelSelections === null
         ? null
@@ -658,6 +657,12 @@ export function useComposerSend(input: ComposerSendInput) {
       composerImages.length === 0 &&
       composerFiles.length === 0
     ) {
+      // A plan follow-up starts a provider turn: an unavailable native selection is refused
+      // before the draft is cleared.
+      if (sendCtx.runtimeModeBlockReason !== null) {
+        setThreadError(activeThread.id, sendCtx.runtimeModeBlockReason);
+        return;
+      }
       const followUp = resolvePlanFollowUpSubmission({
         draftText: promptForSend,
         planMarkdown: activeProposedPlan.planMarkdown,
@@ -764,6 +769,14 @@ export function useComposerSend(input: ComposerSendInput) {
       return;
     }
     const threadIdForSend = activeThread.id;
+    // From here every path starts or queues a provider turn, except typed feedback on a pending
+    // approval, which answers the running turn's request. An unavailable native selection is
+    // refused before the draft is consumed, so the prompt and every selected model stay intact.
+    if (approvalFeedbackTarget === undefined && sendCtx.runtimeModeBlockReason !== null) {
+      notifyDirectAnnotationAttached();
+      setThreadError(threadIdForSend, sendCtx.runtimeModeBlockReason);
+      return;
+    }
     const sendSnapshot = snapshotComposerSend({
       prompt: promptForSend,
       images: composerImages,

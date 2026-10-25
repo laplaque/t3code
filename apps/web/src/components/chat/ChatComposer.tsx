@@ -70,8 +70,10 @@ import {
   formatAssistantCitationForComposer,
   isPathSuggestionCurrent,
   extendReplacementRangeForTrailingSpace,
+  parseStandaloneComposerSlashCommand,
   replaceTextRange,
 } from "../../composer-logic";
+import { parseCodexFeedbackCommand } from "@t3tools/client-runtime/state/threads";
 import { DISCONNECTED_COMPOSER_PLACEHOLDER } from "../../composerPlaceholder";
 import {
   deriveComposerSendState,
@@ -995,6 +997,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     selectedProviderEntry?.snapshot,
     selectedModel,
   );
+  // useComposerSend refuses an unavailable native turn itself; this gate only keeps the
+  // button usable for the submissions that never start one: a queued-message edit, typed
+  // feedback on the shown approval, and the standalone local commands.
+  const runtimeModeSendBlockReason =
+    runtimeModeBlockReason !== null &&
+    !isEditingQueuedMessage &&
+    pendingApprovals.find((approval) => !heldRequestIds.has(approval.requestId))
+      ?.supportsFeedback !== true &&
+    parseStandaloneComposerSlashCommand(prompt) === null &&
+    (selectedProvider !== "codex" || parseCodexFeedbackCommand(prompt) === null)
+      ? runtimeModeBlockReason
+      : null;
   const sendDisabledReason =
     externalSendDisabledReason ??
     (multipleModelSelections?.length === 0 ? "Select at least one model." : null) ??
@@ -1002,7 +1016,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       ? attachmentBlockReason
       : (attachmentBlockReason ??
         (multipleModelSelections === null ? providerSendBlockReason : null) ??
-        runtimeModeBlockReason));
+        runtimeModeSendBlockReason));
   const isSendDisabled = sendDisabledReason !== null;
   const selectedProviderStatus = selectedProviderEntry?.snapshot ?? null;
   const compactCommandAvailable = providerSupportsManualCompaction(selectedProviderEntry);
